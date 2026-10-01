@@ -1,0 +1,1 @@
+const t=new Date('2026-11-12T19:30:00');setInterval(()=>{let d=t-new Date();if(d<0)d=0;const day=Math.floor(d/864e5),h=Math.floor(d/36e5)%24,m=Math.floor(d/6e4)%60,s=Math.floor(d/1e3)%60;document.getElementById('count').textContent='باقي على فرحتنا: '+day+' يوم، '+h+' ساعة، '+m+' دقيقة، '+s+' ثانية';},1000);

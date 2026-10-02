@@ -18,3 +18,27 @@
 
 .top-count{max-width:680px;margin:0 auto 22px;padding:14px 12px 16px;border:1px solid #d8b66d;border-radius:20px;background:rgba(255,250,244,.92);box-shadow:0 12px 30px #70451f18;color:#805a31}
 .top-count span{display:block;font-size:14px;letter-spacing:1px;margin-bottom:8px;color:#9b7440}.top-count #count{font-size:15px;font-weight:700;color:#8a6029;border:0;margin:0;padding:0}
+
+/* Refined compact luxury layout */
+.visual,.royal,.quote,.details,.movie,.closing{min-height:0!important}
+.royal{padding:22px 12px 42px!important}
+.quote{padding:44px 18px!important}
+.details{padding:48px 14px!important}
+.movie{padding:48px 14px!important}
+.closing{padding:52px 18px!important}
+footer{padding:30px 18px!important}
+.royal-frame{max-width:560px!important}
+.royal-actions{margin-top:20px!important}
+.top-count{max-width:560px!important;margin-bottom:14px!important;padding:11px 10px 13px!important}
+.royal h2{font-size:30px!important;margin:5px 0 15px!important}
+.royal:before{margin-bottom:5px!important}
+.quote p{margin:8px auto!important}
+.details h2,.movie h2,.closing h2{margin:8px 0 22px!important}
+.cards{margin:24px auto!important}
+.rsvp-main{background:linear-gradient(135deg,#d2ad63,#8c5f25)!important;box-shadow:0 12px 30px #8b5c2838!important}
+@media(max-width:600px){
+ .royal{padding:14px 8px 30px!important}
+ .quote{padding:34px 16px!important}.details,.movie{padding:38px 10px!important}.closing{padding:40px 15px!important}
+ .photo-frame{box-shadow:0 18px 42px #5d382c2e!important}
+ .royal-actions{gap:9px!important}
+}

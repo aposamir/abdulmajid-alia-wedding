@@ -51,3 +51,9 @@ footer{padding:30px 18px!important}
 .card-rsvp{right:15%;bottom:13.2%;width:31%;height:6.8%}
 .card-hotspot:focus-visible{outline:2px solid rgba(190,145,67,.75)!important;outline-offset:2px}
 .royal-actions{display:none!important}
+
+/* Correct tap zones: printed buttons sit near the bottom of the card */
+.interactive-card{overflow:hidden!important}
+.card-hotspot{z-index:999!important;pointer-events:auto!important;-webkit-tap-highlight-color:rgba(190,145,67,.18);touch-action:manipulation}
+.card-share{left:8%!important;bottom:4.1%!important;width:40%!important;height:5.9%!important}
+.card-rsvp{right:8%!important;bottom:4.1%!important;width:40%!important;height:5.9%!important}

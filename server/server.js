@@ -1,7 +1,8 @@
 // RSVP fan-out: receives one confirmation and sends it to all hosts at once
-// via WhatsApp Cloud API. No dependencies (Node 18+).
+// via Twilio WhatsApp. No dependencies (Node 18+).
 //
-// Env: WA_TOKEN, WA_PHONE_ID (required); ALLOWED_ORIGIN, PORT, WA_TEMPLATE (optional)
+// Env: TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM (e.g. +14155238886) required;
+// TWILIO_CONTENT_SID, ALLOWED_ORIGIN, PORT optional
 const http = require("http");
 
 const RECIPIENTS = [
@@ -11,28 +12,21 @@ const RECIPIENTS = [
   "4917670604017",
   "963951970692",
 ];
-const { WA_TOKEN, WA_PHONE_ID, WA_TEMPLATE } = process.env;
+const { TWILIO_SID, TWILIO_TOKEN, TWILIO_FROM, TWILIO_CONTENT_SID } = process.env;
 const ORIGIN = process.env.ALLOWED_ORIGIN || "https://aposamir.github.io";
-
-function payload(to, text, name, guests) {
-  if (WA_TEMPLATE) {
-    // Template with 2 body params: {{1}} name, {{2}} guests (works outside the 24h window)
-    return { messaging_product: "whatsapp", to, type: "template",
-      template: { name: WA_TEMPLATE, language: { code: "ar" },
-        components: [{ type: "body", parameters: [
-          { type: "text", text: name }, { type: "text", text: String(guests) }] }] } };
-  }
-  return { messaging_product: "whatsapp", to, type: "text", text: { body: text } };
-}
+const AUTH = "Basic " + Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString("base64");
 
 async function sendAll(name, guests) {
   const text = `🌹 تأكيد حضور\nالاسم: ${name}\nعدد الحضور: ${guests}\nحفل زفاف عبد المجيد وعليا — 12/11/2026`;
   return Promise.all(RECIPIENTS.map(async (to) => {
+    const form = new URLSearchParams({ From: `whatsapp:${TWILIO_FROM}`, To: `whatsapp:+${to}` });
+    if (TWILIO_CONTENT_SID) { // approved template with variables {{1}} name, {{2}} guests
+      form.set("ContentSid", TWILIO_CONTENT_SID);
+      form.set("ContentVariables", JSON.stringify({ 1: name, 2: String(guests) }));
+    } else form.set("Body", text);
     try {
-      const r = await fetch(`https://graph.facebook.com/v20.0/${WA_PHONE_ID}/messages`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" },
-        body: JSON.stringify(payload(to, text, name, guests)),
+      const r = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`, {
+        method: "POST", headers: { Authorization: AUTH }, body: form,
       });
       return { to, ok: r.ok };
     } catch { return { to, ok: false }; }

@@ -1,0 +1,88 @@
+{
+  "name": "Wedding RSVP",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wedding-rsvp",
+        "responseMode": "onReceived",
+        "options": {
+          "allowedOrigins": "https://aposamir.github.io"
+        }
+      },
+      "id": "n1",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "wedding-rsvp"
+    },
+    {
+      "parameters": {
+        "jsCode": "const nums = [\"+963949954998\",\"+4917683247825\",\"+971544000556\",\"+4917670604017\",\"+963951970692\"];\nconst b = $input.first().json.body || {};\nconst name = String(b.name || \"\").trim().slice(0, 60);\nconst guests = Math.min(20, Math.max(1, parseInt(b.guests, 10) || 1));\nif (!name) throw new Error(\"name required\");\nconst message = `🌹 تأكيد حضور\\nالاسم: ${name}\\nعدد الحضور: ${guests}\\nحفل زفاف عبد المجيد وعليا — 12/11/2026`;\nreturn nums.map(to => ({ json: { to, message } }));"
+      },
+      "id": "n2",
+      "name": "Split to 5 numbers",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "sms",
+        "operation": "send",
+        "from": "+14155238886",
+        "to": "={{ $json.to }}",
+        "toWhatsapp": true,
+        "message": "={{ $json.message }}"
+      },
+      "id": "n3",
+      "name": "Twilio WhatsApp",
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        480,
+        0
+      ],
+      "credentials": {
+        "twilioApi": {
+          "id": "",
+          "name": "Twilio account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Split to 5 numbers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split to 5 numbers": {
+      "main": [
+        [
+          {
+            "node": "Twilio WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

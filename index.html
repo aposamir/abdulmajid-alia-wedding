@@ -7,9 +7,9 @@
 .page{position:relative;width:min(100%,520px);margin:auto;overflow:hidden;background:#000;line-height:0;min-height:100svh;display:flex;align-items:center}
 .video{display:block;width:100%;height:auto;max-height:100svh;object-fit:contain;background:#000}
 .counter{position:absolute;z-index:7;top:max(1.5%,env(safe-area-inset-top));left:50%;transform:translateX(-50%);display:flex;align-items:center;justify-content:center;gap:4px;direction:ltr;line-height:1;padding:5px 10px;border-radius:999px;background:rgba(15,10,7,.16);backdrop-filter:blur(2px);pointer-events:none;white-space:nowrap}
-.counter:before{content:"⏳";font-size:13px;filter:drop-shadow(0 1px 3px #000)}
-.unit{display:flex;align-items:center}.unit:not(:last-child):after{content:":";font:700 14px/1 Tahoma,Arial,sans-serif;color:#d9ae62;margin-left:4px;text-shadow:0 1px 4px #000}
-.unit b{font:900 clamp(15px,4.3vw,23px)/1 Tahoma,Arial,sans-serif;color:#d8aa52;text-shadow:0 1px 0 #fff0b0,0 1px 0 #805414,0 2px 5px #000b,0 0 6px #ffd77c88;-webkit-text-stroke:.2px #8e6427}
+.counter:before{content:"⏳";font-size:13px;filter:grayscale(1) brightness(.25);text-shadow:0 1px 2px #fff8}
+.unit{display:flex;align-items:center}.unit:not(:last-child):after{content:":";font:700 14px/1 Tahoma,Arial,sans-serif;color:#17120f;margin-left:4px;text-shadow:0 1px 2px #fff9}
+.unit b{font:900 clamp(15px,4.3vw,23px)/1 Tahoma,Arial,sans-serif;color:#17120f;text-shadow:0 1px 2px #fff9,0 2px 5px #fff5;-webkit-text-stroke:.15px #000}
 .actions{position:absolute;z-index:9;left:5%;right:5%;bottom:max(1.8%,env(safe-area-inset-bottom));display:grid;grid-template-columns:repeat(3,1fr);gap:7px;line-height:1.2;opacity:0;transform:translateY(18px);pointer-events:none;transition:opacity .7s ease,transform .7s ease}
 .actions.show{opacity:1;transform:translateY(0);pointer-events:auto}
 .hit{min-height:42px;border:1px solid #c79a60cc;border-radius:17px;background:linear-gradient(135deg,#fffdf5ef,#f4dfc9ed);box-shadow:0 5px 18px #0007,inset 0 0 0 1px #fff9;color:#65431e;text-decoration:none;font:700 10.5px/1.15 Tahoma,Arial,sans-serif;display:flex;align-items:center;justify-content:center;cursor:pointer;padding:5px 3px;backdrop-filter:blur(8px)}

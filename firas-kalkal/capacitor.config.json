@@ -1,0 +1,12 @@
+{
+  "appId": "com.firaskalkal.app",
+  "appName": "طلبات فراس كلكل",
+  "webDir": "www",
+  "server": {
+    "url": "https://fras-ordr.onrender.com",
+    "cleartext": false
+  },
+  "android": {
+    "backgroundColor": "#04332e"
+  }
+}

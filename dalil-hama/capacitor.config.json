@@ -1,0 +1,12 @@
+{
+  "appId": "cfd.majid.dalilhama",
+  "appName": "دليل حماة",
+  "webDir": "www",
+  "server": {
+    "allowNavigation": ["dalil-hama.majid.cfd"],
+    "cleartext": false
+  },
+  "android": {
+    "backgroundColor": "#0f2a44"
+  }
+}

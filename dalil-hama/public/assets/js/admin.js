@@ -29,7 +29,11 @@ const auth = {
     this.session = { access_token: r.access_token, refresh_token: r.refresh_token, expires_at: exp, email: r.user && r.user.email };
     store.set(SESSION_KEY, this.session);
   },
-  clear() { this.session = null; store.del(SESSION_KEY); },
+  clear() {
+    const s = store.get(SESSION_KEY);
+    if (!s || !this.session || s.refresh_token === this.session.refresh_token) store.del(SESSION_KEY);
+    this.session = null;
+  },
   async login(email, password) {
     const r = await request('/auth/v1/token?grant_type=password', { method: 'POST', body: { email, password } });
     this.save(r);
@@ -39,6 +43,7 @@ const auth = {
     // تبويب آخر جدّد الجلسة: نعتمد جلسته بدلاً من تجديد ثانٍ برمز صار ملغى
     const s = store.get(SESSION_KEY);
     if (s && s.refresh_token && s.refresh_token !== this.session.refresh_token) {
+      if (s.email !== this.session.email) throw new ApiError('session belongs to another account', 401);
       this.session = s;
       return;
     }
@@ -345,7 +350,7 @@ function confirmBox(msg, { ok = 'تأكيد', danger = false } = {}) {
   return new Promise((resolve) => {
     const d = document.createElement('dialog');
     d.className = 'confirm';
-    d.innerHTML = `<p>${msg}</p><form method="dialog" class="confirm-ops"><button value="ok" class="btn ${danger ? 'btn-danger' : 'btn-primary'}">${ok}</button><button value="" class="btn btn-soft">إلغاء</button></form>`;
+    d.innerHTML = `<p>${msg}</p><form method="dialog" class="confirm-ops"><button value="ok" class="btn ${danger ? 'btn-danger' : 'btn-primary'}">${ok}</button><button value="" class="btn btn-soft"${danger ? ' autofocus' : ''}>إلغاء</button></form>`;
     document.body.append(d);
     d.addEventListener('close', () => { resolve(d.returnValue === 'ok'); d.remove(); });
     d.addEventListener('click', (e) => { if (e.target === d) d.close(''); });
@@ -727,9 +732,15 @@ function editListing(id, preset = {}) {
     }).catch(() => {});
     sh.querySelector('#del-btn').onclick = async () => {
       if (!(await confirmBox(`حذف «${esc(r.name)}» نهائياً؟ يمكنك بدلاً من ذلك تغيير حالته إلى «مخفي».`, { ok: 'حذف نهائي', danger: true }))) return;
-      try { await rest(`listings?id=eq.${id}`, { method: 'DELETE' }); removeLocal(id); toast('تم الحذف'); refreshStats(); route(); } catch (err) { toast(errMsg(err), true); }
+      try { await rest(`listings?id=eq.${id}`, { method: 'DELETE' }); removeLocal(id); closeSheet(); toast('تم الحذف'); refreshStats(); route(); } catch (err) { toast(errMsg(err), true); }
     };
-    sh.querySelector('#merge-btn').onclick = () => mergeDialog(id);
+    // F6: الدمج يفتح نافذة أخرى، فننبّه قبل ضياع التعديلات غير المحفوظة
+    const snap = () => JSON.stringify([[...new FormData(form)], $$('.ph input', form).map((i) => i.value)]);
+    const initial = snap();
+    sh.querySelector('#merge-btn').onclick = async () => {
+      if (snap() !== initial && !(await confirmBox('لديك تعديلات غير محفوظة ستُفقد عند الانتقال إلى الدمج. متابعة؟', { ok: 'متابعة' }))) return;
+      mergeDialog(id);
+    };
   }
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -812,11 +823,13 @@ function auditItem(l) {
 
 function mergeDialog(keepId) {
   const keep = A.byId.get(keepId);
+  if (!keep) return;
   const sh = openSheet('دمج نشاط مكرر', `<p style="margin-top:0">سيُحتفظ بـ «<b>${esc(keep.name)}</b>» وتُنقل إليه الأرقام والمعلومات الناقصة من النشاط المكرر، ثم يُحذف المكرر.</p>
     <input class="input" id="m-q" placeholder="ابحث عن النشاط المكرر…" autocomplete="off"><div class="pick-list" id="m-list"></div>`);
   const draw = () => {
     const q = sh.querySelector('#m-q').value.trim();
-    const sameP = A.listings.filter((x) => x.id !== keepId && (x.phones || []).some((p) => (keep.phones || []).includes(p)));
+    const cur = A.byId.get(keepId) || keep;
+    const sameP = A.listings.filter((x) => x.id !== keepId && (x.phones || []).some((p) => (cur.phones || []).includes(p)));
     const res = q ? A.index.search(q).results.map((c) => c._row).filter((x) => x.id !== keepId).slice(0, 10) : sameP;
     sh.querySelector('#m-list').innerHTML = res.map((x) => `<button type="button" data-m="${x.id}">${esc(x.name)} <small>#${x.id} · ${esc(catName(x.category_id))} · ${(x.phones || []).join(' / ')}</small></button>`).join('') || '<p class="muted">اكتب للبحث.</p>';
   };
@@ -826,6 +839,8 @@ function mergeDialog(keepId) {
     const b = e.target.closest('[data-m]');
     if (!b) return;
     const drop = A.byId.get(Number(b.dataset.m));
+    const keep = A.byId.get(keepId); // الصف الحالي، لا النسخة الملتقطة عند فتح النافذة
+    if (!drop || !keep) { draw(); return; }
     if (!(await confirmBox(`دمج «${esc(drop.name)}» في «${esc(keep.name)}» ثم حذفه؟`, { ok: 'دمج' }))) return;
     try {
       const body = {
@@ -844,6 +859,7 @@ function mergeDialog(keepId) {
       await rest(`listings?id=eq.${drop.id}`, { method: 'DELETE' });
       removeLocal(drop.id);
       upsertLocal(row);
+      closeSheet();
       toast('تم الدمج ✓');
       route();
     } catch (err) { toast(errMsg(err), true); }
@@ -1100,6 +1116,7 @@ function viewIO(el) {
         if (m.lat !== null) { o.lat = +m.lat.toFixed(6); o.lng = +m.lng.toFixed(6); }
       }
       if (id) o.id = id;
+      if (old) o._old = true;
       if (!catByName.has(normalize(r['التصنيف'] || '')) && id && A.byId.has(id)) delete o.category_id;
       return o;
     }).filter((o) => o && o.name.length >= 2);
@@ -1123,11 +1140,15 @@ function viewIO(el) {
             await rest('listings?on_conflict=id', { method: 'POST', body: batch.slice(i, i + 400), headers: { Prefer: 'resolution=merge-duplicates,return=minimal' } });
           }
         }
-        const fresh = inserts.map(({ id, ...o }) => ({ tags: [], lat: null, lng: null, ...o }));
-        const keys = [...new Set(fresh.flatMap((o) => Object.keys(o)))];
-        const norm = fresh.map((o) => Object.fromEntries(keys.map((k) => [k, o[k] ?? (k === 'tags' || k === 'phones' ? [] : (k === 'featured' || k === 'verified' ? false : null))])));
-        for (let i = 0; i < norm.length; i += 400) {
-          await rest('listings', { method: 'POST', body: norm.slice(i, i + 400), headers: { Prefer: 'return=minimal' } });
+        const withId = inserts.filter((o) => o._old && o.id).map(({ _old, ...o }) => ({ tags: [], lat: null, lng: null, ...o }));
+        const noId = inserts.filter((o) => !(o._old && o.id)).map(({ id, _old, ...o }) => ({ tags: [], lat: null, lng: null, ...o }));
+        for (const fresh of [withId, noId]) {
+          if (!fresh.length) continue;
+          const keys = [...new Set(fresh.flatMap((o) => Object.keys(o)))];
+          const norm = fresh.map((o) => Object.fromEntries(keys.map((k) => [k, o[k] ?? (k === 'tags' || k === 'phones' ? [] : (k === 'featured' || k === 'verified' ? false : null))])));
+          for (let i = 0; i < norm.length; i += 400) {
+            await rest('listings', { method: 'POST', body: norm.slice(i, i + 400), headers: { Prefer: 'return=minimal' } });
+          }
         }
         toast('تم الاستيراد ✓');
         A.listings = await fetchAllListings();

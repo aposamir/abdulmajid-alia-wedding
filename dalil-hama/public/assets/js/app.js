@@ -99,8 +99,14 @@ function params() {
   const g = (k) => u.searchParams.get(k) || '';
   return {
     q: g('q'), c: Number(g('c')) || null, a: g('a'), v: g('v'), s: g('s'), m: g('m') === '1',
-    l: Number(g('l')) || null, hash: u.hash.slice(1),
+    l: Number(g('l')) || null, hash: routerHash(u.hash),
   };
+}
+
+const ROUTER_HASH = /^(add|report|addphone)(-\d+)?$/;
+function routerHash(h) {
+  const v = String(h || '').replace(/^#/, '');
+  return ROUTER_HASH.test(v) ? v : '';
 }
 
 function urlFor(p) {
@@ -365,7 +371,7 @@ function renderList(p, mode) {
     ${extra}
     ${p.m && mode !== 'favs' ? '<div class="map-box" id="map"></div>' : '<div class="list" id="list"></div><div class="sentinel" id="sentinel"></div>'}`;
 
-  scheduleSearchLog(p.q, list.length);
+  if (p.q) scheduleSearchLog(p.q, mode === 'search' && !p.c && !p.a ? list.length : state.index.search(p.q).results.length);
   if (!list.length && !(mode === 'near' && !state.geo)) {
     ($('#list') || $('#map')).outerHTML = emptyState(mode, p);
     return;
@@ -788,8 +794,12 @@ function locate(quiet = false) {
   navigator.geolocation.getCurrentPosition((pos) => {
     state.geo = { lat: pos.coords.latitude, lng: pos.coords.longitude, at: Date.now() };
     store.set('dh:geo', state.geo);
-    state.viewKey = '';
-    sync();
+    const p = params();
+    const showsDistance = p.v === 'near' || p.s === 'near';
+    if (!quiet || (showsDistance && window.scrollY < 400)) {
+      state.viewKey = '';
+      sync();
+    }
     const far = distance(state.geo.lat, state.geo.lng, 35.1318, 36.7578) > 40000;
     if (!quiet || far) toast(far ? 'يبدو أنك خارج حماة، رتّبنا لك حسب الأقرب على أي حال' : 'تم تحديد موقعك ✓');
   }, (err) => {
@@ -848,15 +858,15 @@ document.addEventListener('click', (e) => {
     const u = new URL(a.href);
     if (u.pathname !== '/' && u.pathname !== '/index.html') return;
     const raw = a.getAttribute('href');
-    if (raw.startsWith('#') && !/^#(add|report|addphone)(-\d+)?$/.test(raw)) return;
+    if (raw.startsWith('#') && !routerHash(raw)) return;
     e.preventDefault();
     const sp = u.searchParams;
     const next = {
       q: sp.get('q') || '', c: Number(sp.get('c')) || null, a: sp.get('a') || '', v: sp.get('v') || '',
-      s: sp.get('s') || '', m: sp.get('m') === '1', l: Number(sp.get('l')) || null, hash: u.hash.slice(1),
+      s: sp.get('s') || '', m: sp.get('m') === '1', l: Number(sp.get('l')) || null, hash: routerHash(u.hash),
     };
     if (u.hash && !u.search && a.getAttribute('href').startsWith('#')) {
-      go({ hash: u.hash.slice(1), l: null }, { keep: true, push: !history.state?.sheet });
+      go({ hash: routerHash(u.hash), l: null }, { keep: true, push: !history.state?.sheet });
     } else {
       if (sheetEls) {
         const pushed = !!(history.state && history.state.sheet);
@@ -878,7 +888,7 @@ document.addEventListener('change', (e) => {
   if (!f) return;
   const k = f.dataset.filter;
   const v = f.value;
-  if (k === 's' && v === 'near' && geoStale()) locate();
+  if (k === 's' && v === 'near' && geoStale()) { state.geoTried = true; locate(); }
   go({ [k]: k === 'c' ? (Number(v) || null) : v }, { keep: true, push: false });
 });
 

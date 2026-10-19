@@ -3,6 +3,8 @@ import { normalize, normalizeMap, esc, toLatinDigits } from './core.js';
 
 const STOP = new Set(['في', 'من', 'على', 'عن', 'الى', 'قرب', 'جانب', 'مقابل', 'حي', 'و', 'ب', 'مدينه', 'حماه', 'رقم', 'هاتف', 'تلفون']);
 const PREFIXES = ['وال', 'بال', 'فال', 'كال', 'لل', 'ال'];
+// كلمات تصف مكاناً لا نوع نشاط: «سوق الحدادين» يبحث عن المحلات الواقعة فيه
+const PLACE = new Set(['سوق', 'شارع', 'دوار', 'ساحه', 'طريق', 'جسر', 'باب', 'مدخل']);
 
 /** تجذيع خفيف: إزالة «ال» وأدوات الجر الملتصقة وبعض اللواحق الشائعة */
 export function stem(t) {
@@ -80,7 +82,7 @@ export class SearchIndex {
     // البحث برقم الهاتف
     const digits = q.replace(/[\s\-+()]/g, '');
     if (/^\d{3,}$/.test(digits)) {
-      let d = digits.replace(/^00963|^963/, '').replace(/^0+/, '');
+      let d = digits.replace(/^00963|^963/, '').replace(/^0+/, '').replace(/^33(\d{7})$/, '13$1');
       if (!d) d = digits;
       const results = pool.filter((it) => it._dig.includes(d));
       return { results, cats: [], fuzzy: false, terms: [], phone: true };
@@ -108,10 +110,15 @@ export class SearchIndex {
     ));
 
     const qn = normalize(q);
+    const placeQuery = qn.includes(' ') && PLACE.has(terms[0]);
     const scored = [];
     for (const it of pool) {
       let total = 0;
       let ok = true;
+      // الاسم يبدأ بالعبارة كاملة («جامعة حماة»): مقصود بعينه
+      const fullName = it._nn === qn || (qn.includes(' ') && it._nn.startsWith(qn + ' '));
+      // «سوق الحدادين»… بالعبارة كاملة في العنوان: بحث عن مكان لا عن تصنيف
+      const phrase = placeQuery && it._hay.includes(qn);
       for (let i = 0; i < stems.length; i++) {
         const s = origStems[i];
         let sc = 0;
@@ -122,16 +129,16 @@ export class SearchIndex {
         if (!sc && s.length >= 3 && it._nn.includes(s)) sc = 5;
         if (catHits[i].has(it.c)) sc = sc ? sc + 4 : 8;
         // الكلمة تدل على تصنيف والنشاط من تصنيف آخر: تطابق الاسم عَرَضي («دكتور بطاطا» ليس طبيباً)
-        else if (sc && catHits[i].size) sc = Math.min(sc, 7);
+        else if (sc && catHits[i].size && !fullName) sc = Math.min(sc, 7);
         if (!sc && areaHits[i].has(it.a)) sc = 5;
         // كلمة تدل على تصنيف لا تكفيها مطابقة العنوان («مقابل صيدلية...» ليس صيدلية)
-        if (!sc && !catHits[i].size && s.length >= 2 && it._ext.some((x) => x.startsWith(s))) sc = 3;
+        if (!sc && (phrase || !catHits[i].size) && s.length >= 2 && it._ext.some((x) => x.startsWith(s))) sc = 3;
         if (!sc) { ok = false; break; }
         total += sc;
       }
       if (!ok) continue;
       if (it._tok[0] === origStems[0]) total += 3;
-      if (it._nn.startsWith(qn) && qn.includes(' ')) total += 3;
+      if (fullName) total += 8;
       if (it._hasPhone) total += 2;
       if (it.f) total += 4;
       if (it.v) total += 1;
@@ -140,15 +147,22 @@ export class SearchIndex {
     }
 
     let fuzzy = false;
+    const fuzzyCat = [];
     if (!scored.length) {
       fuzzy = true;
+      // فقط لكلمة لم تطابق تصنيفاً ولا حياً («كازو» حي، وليست خطأً في «كاتو»)
+      origStems.forEach((s, i) => {
+        fuzzyCat.push(s.length >= 4 && !catHits[i].size && !areaHits[i].size
+          ? new Set(this.catTokens.filter((ct) => ct.stems.some((x) => x.length >= 4 && near(x, s))).map((ct) => ct.id))
+          : new Set());
+      });
       for (const it of pool) {
         let total = 0;
         for (let i = 0; i < origStems.length; i++) {
           const s = origStems[i];
           if (s.length < 3) continue;
-          if (catHits[i].has(it.c)) total += 8;
-          else if (it._tok.some((tk) => tk.startsWith(s))) total += catHits[i].size ? 3 : 6;
+          if (catHits[i].has(it.c) || fuzzyCat[i].has(it.c)) total += 8;
+          else if (it._tok.some((tk) => tk.startsWith(s))) total += catHits[i].size || fuzzyCat[i].size ? 3 : 6;
           else if (areaHits[i].has(it.a)) total += 4;
           else if (s.length >= 5 && it._tok.some((tk) => near(tk, s))) total += 3;
           else if (it._ext.some((x) => x.startsWith(s))) total += 1;
@@ -158,7 +172,7 @@ export class SearchIndex {
     }
 
     scored.sort((a, b) => b[0] - a[0] || a[1].n.localeCompare(b[1].n, 'ar'));
-    const cats = [...new Set(catHits.flatMap((s) => [...s]))].slice(0, 4);
+    const cats = [...new Set([...catHits, ...fuzzyCat].flatMap((s) => [...s]))].slice(0, 4);
     return { results: scored.map((x) => x[1]), cats, fuzzy, terms: origStems };
   }
 }

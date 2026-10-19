@@ -66,6 +66,8 @@ def normalize_phone(p: str):
     elif intl and not re.match(r"^0*1", d):
         return "+" + re.sub(r"^00", "", d)
     d = d.lstrip("0")
+    if re.fullmatch(r"33\d{7}", d):  # رمز حماة القديم 033 صار 013
+        d = "13" + d[2:]
     if len(d) >= 8:
         return "0" + d
     if re.fullmatch(r"2\d{6}", d):  # رقم أرضي محلي في حماة بلا رمز المنطقة

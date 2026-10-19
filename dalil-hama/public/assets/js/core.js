@@ -86,6 +86,7 @@ export function normalizePhone(p) {
   else if (d.startsWith('963') && d.length >= 11) d = d.slice(3);
   else if (intl && !/^0*1/.test(d)) return '+' + d.replace(/^00/, '');
   d = d.replace(/^0+/, '');
+  if (/^33\d{7}$/.test(d)) d = '13' + d.slice(2); // رمز حماة القديم 033 صار 013
   if (d.length >= 8) return '0' + d;
   if (/^2\d{6}$/.test(d)) return '013' + d;
   return raw.replace(/\D/g, '');

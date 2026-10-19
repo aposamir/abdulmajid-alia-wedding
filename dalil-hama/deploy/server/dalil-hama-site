@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+# دليل حماة — تشغيل الموقع الجديد على سيرفر majid.cfd خلف Caddy، مع تحديث تلقائي ورجوع فوري.
+#
+# أول مرة، على السيرفر:
+#   curl -fsSL <رابط هذا الملف> -o /tmp/dalil-hama-site && sudo bash /tmp/dalil-hama-site install
+#
+# بعد التثبيت:
+#   sudo dalil-hama-site status     حالة الموقع والتحديث
+#   sudo dalil-hama-site update     جلب آخر إصدار الآن (يجري تلقائياً كل 10 دقائق)
+#   sudo dalil-hama-site previous   الرجوع إلى الإصدار السابق وإيقاف التحديث التلقائي
+#   sudo dalil-hama-site resume     استئناف التحديث التلقائي
+#   sudo dalil-hama-site rollback   إعادة النطاق إلى الموقع القديم فوراً
+#
+# لا يمس هذا الأمر الموقعَ القديم (خدمة dalil-hama وقاعدة بياناتها) ولا مواقع Caddy الأخرى:
+# يستبدل كتلة dalil-hama.majid.cfd وحدها بسطر import، ويحفظ نسخة منها لإعادتها عند الرجوع.
+set -Eeuo pipefail
+umask 022
+
+HOST=${DH_HOST:-dalil-hama.majid.cfd}
+REPO=${DH_REPO:-aposamir/abdulmajid-alia-wedding}
+BRANCH=${DH_BRANCH:-claude/dalil-hama-rebuild-tvy38e}
+SUBDIR=dalil-hama/public
+BASE=${DH_BASE:-/var/www/dalil-hama}
+STATE=${DH_STATE:-/var/lib/dalil-hama-site}
+ETC=${DH_ETC:-/etc/dalil-hama-site}
+CONF=$ETC/config
+SITE_CONF=$ETC/site.caddy
+CADDYFILE=${DH_CADDYFILE:-}
+SELF_DST=${DH_SELF_DST:-/usr/local/sbin/dalil-hama-site}
+UNIT_DIR=${DH_UNIT_DIR:-/etc/systemd/system}
+UNIT=dalil-hama-site-update
+SITE_USER=${DH_SITE_USER:-dalil-site}
+KEEP=5
+PORT=${DH_VERIFY_PORT:-443}
+read -r -a VERIFY_OPTS <<< "${DH_VERIFY_CURL_OPTS:-}"
+MARKER='# dalil-hama-site: الموقع الجديد لدليل حماة. للرجوع إلى القديم: sudo dalil-hama-site rollback'
+QUIET=0
+TMP=
+
+cleanup() { [ -n "$TMP" ] && rm -rf -- "$TMP"; return 0; }
+trap cleanup EXIT
+
+say()  { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+ok()   { say "✓ $*"; }
+warn() { printf '! %s\n' "$*" >&2; }
+die()  { printf '✗ %s\n' "$*" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "شغّل الأمر بصلاحية الجذر: sudo $0 $*"; }
+
+need_tools() {
+  local t
+  for t in "$@"; do command -v "$t" >/dev/null 2>&1 || die "الأداة $t غير مثبّتة على السيرفر"; done
+}
+
+is_sha() { [[ ${1:-} =~ ^[0-9a-f]{40}$ ]]; }
+
+# إعدادات اختيارية في $CONF بصيغة KEY=VALUE (REPO وBRANCH فقط)، تُقرأ ولا تُنفَّذ
+load_conf() {
+  [ -r "$CONF" ] || return 0
+  local key val
+  while IFS='=' read -r key val; do
+    val=${val%$'\r'}; val=${val#\"}; val=${val%\"}
+    case $key in
+      REPO)   [ -z "${DH_REPO:-}" ]   && [[ $val =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && REPO=$val ;;
+      BRANCH) [ -z "${DH_BRANCH:-}" ] && [[ $val =~ ^[A-Za-z0-9._/-]+$ ]] && BRANCH=$val ;;
+    esac
+  done < <(grep -E '^(REPO|BRANCH)=' "$CONF" || true)
+}
+
+take_lock() {
+  mkdir -p "$BASE"
+  exec 9>>"$BASE/.lock"
+  flock -w 300 9 || die "عملية أخرى للموقع قيد التنفيذ؛ أعد المحاولة بعد قليل"
+}
+
+remote_sha() {
+  local out=
+  if [ -n "${DH_SOURCE_SHA:-}" ]; then out=$DH_SOURCE_SHA
+  else
+    if command -v git >/dev/null 2>&1; then
+      out=$(GIT_TERMINAL_PROMPT=0 timeout 60 git ls-remote "https://github.com/$REPO.git" "refs/heads/$BRANCH" 2>/dev/null | awk 'NR==1{print $1}') || out=
+    fi
+    if ! is_sha "$out"; then
+      out=$(curl -fsSL --connect-timeout 20 --max-time 60 -H 'Accept: application/vnd.github.sha' \
+        "https://api.github.com/repos/$REPO/commits/$BRANCH" 2>/dev/null) || out=
+    fi
+  fi
+  is_sha "$out" || return 1
+  printf '%s\n' "$out"
+}
+
+current_sha() {
+  local t
+  t=$(readlink "$BASE/current" 2>/dev/null) || return 1
+  t=${t##*/}
+  is_sha "$t" || return 1
+  printf '%s\n' "$t"
+}
+
+# الإصدار الذي يعرضه Caddy فعلاً: من السيرفر نفسه أولاً (دون أي وكيل)، ثم عبر العنوان العام
+# إن تعذّر الاتصال المحلي. ردّ HTTP بخطأ (404 من الموقع القديم مثلاً) يعني أن الموقع الجديد غير معروض.
+served_sha() {
+  local out rc url="https://$HOST:$PORT/release.txt"
+  out=$(curl -fsS --noproxy '*' --connect-timeout 3 --max-time 6 ${VERIFY_OPTS[@]+"${VERIFY_OPTS[@]}"} \
+          -H 'Cache-Control: no-cache' --resolve "$HOST:$PORT:127.0.0.1" "$url" 2>/dev/null) && rc=0 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$rc" -eq 22 ] && return 1
+    out=$(curl -fsS --connect-timeout 5 --max-time 8 ${VERIFY_OPTS[@]+"${VERIFY_OPTS[@]}"} \
+            -H 'Cache-Control: no-cache' "$url" 2>/dev/null) || return 1
+  fi
+  out=${out//[$'\r\n\t ']/}
+  is_sha "$out" || return 1
+  printf '%s\n' "$out"
+}
+
+wait_served() {
+  local until=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$until" ]; do
+    [ "$(served_sha || true)" = "$1" ] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# ينزّل الإصدار ويتحقق منه في مجلد مؤقت، ثم ينقله دفعة واحدة إلى releases/<sha>
+fetch_release() {
+  local sha=$1 dir=$BASE/releases/$1 f
+  [ -d "$dir" ] && return 0
+  mkdir -p "$BASE/releases"
+  TMP=$(mktemp -d "$BASE/.tmp.XXXXXX")
+  if [ -n "${DH_SOURCE_TARBALL:-}" ]; then
+    cp -- "$DH_SOURCE_TARBALL" "$TMP/src.tgz"
+  else
+    curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 300 -o "$TMP/src.tgz" \
+      "https://codeload.github.com/$REPO/tar.gz/$sha" || die "تعذّر تنزيل الإصدار ${sha:0:7} من GitHub"
+  fi
+  mkdir "$TMP/site"
+  tar -xzf "$TMP/src.tgz" -C "$TMP/site" --no-same-owner --no-same-permissions \
+      --wildcards --strip-components=3 "*/$SUBDIR/*" 2>/dev/null || die "الملف المنزَّل لا يحوي مجلد $SUBDIR"
+  # ملفات ومجلدات عادية فقط
+  find "$TMP/site" -mindepth 1 ! -type f ! -type d -delete
+  for f in index.html admin/index.html sw.js manifest.webmanifest assets/js/app.js assets/js/admin.js \
+           assets/js/core.js assets/js/search.js assets/js/config.js assets/css/app.css; do
+    [ -s "$TMP/site/$f" ] || die "الإصدار ${sha:0:7} ناقص ($f)؛ لم يتغير شيء"
+  done
+  grep -q '/assets/js/app.js' "$TMP/site/index.html" || die "الإصدار ${sha:0:7} غير صالح؛ لم يتغير شيء"
+  printf '%s\n' "$sha" > "$TMP/site/release.txt"
+  find "$TMP/site" -type d -exec chmod 755 {} +
+  find "$TMP/site" -type f -exec chmod 644 {} +
+  mv -T "$TMP/site" "$dir"
+  rm -rf -- "$TMP"; TMP=
+}
+
+# تبديل ذري للرابط current، مع حفظ الإصدار السابق
+activate() {
+  local sha=$1 cur
+  cur=$(current_sha) || cur=
+  [ "$cur" = "$sha" ] && return 0
+  ln -sfn "releases/$sha" "$BASE/.current.new"
+  mv -Tf "$BASE/.current.new" "$BASE/current"
+  [ -n "$cur" ] && printf '%s\n' "$cur" > "$BASE/previous"
+  return 0
+}
+
+prune() {
+  local cur prev d s n=0
+  cur=$(current_sha) || cur=
+  prev=$(cat "$BASE/previous" 2>/dev/null) || prev=
+  while IFS= read -r d; do
+    d=${d%/}; s=${d##*/}
+    is_sha "$s" || continue
+    if [ "$s" = "$cur" ] || [ "$s" = "$prev" ]; then continue; fi
+    n=$((n + 1))
+    [ "$n" -lt "$KEEP" ] && continue
+    rm -rf -- "${BASE:?}/releases/$s"
+  done < <(ls -1dt "$BASE"/releases/*/ 2>/dev/null || true)
+}
+
+fix_owner() {
+  if [ "$(id -u)" -eq 0 ] && id "$SITE_USER" >/dev/null 2>&1; then
+    chown -R "$SITE_USER:$SITE_USER" "$BASE"
+  fi
+}
+
+# ─────────── Caddy ───────────
+
+detect_caddy() {
+  need_tools caddy systemctl
+  systemctl is-active --quiet caddy || die "خدمة caddy لا تعمل على هذا السيرفر"
+  local exec
+  exec=$(systemctl show caddy -p ExecStart 2>/dev/null) || exec=
+  [[ $exec == *--resume* ]] && die "Caddy يعمل بإعداد محفوظ عبر API (--resume)، فلا يمكن تعديله آلياً؛ لم يتغير شيء"
+  if [ -z "$CADDYFILE" ]; then
+    if [[ $exec =~ --config[[:space:]=]+([^[:space:]\;]+) ]]; then CADDYFILE=${BASH_REMATCH[1]}
+    else CADDYFILE=/etc/caddy/Caddyfile; fi
+  fi
+  [ -f "$CADDYFILE" ] || die "لم أجد ملف إعداد Caddy: $CADDYFILE"
+  case $CADDYFILE in *.json) die "إعداد Caddy بصيغة JSON غير مدعوم آلياً؛ لم يتغير شيء" ;; esac
+}
+
+caddy_validate() { caddy validate --config "$CADDYFILE" --adapter caddyfile >"$STATE/validate.log" 2>&1; }
+caddy_reload()   { systemctl reload caddy >"$STATE/reload.log" 2>&1; }
+
+# يحلل ملفات Caddy ويستبدل كتلة النطاق (أو يعيدها)؛ لا يكتب شيئاً في وضع analyze
+caddy_patch() {
+  python3 - "$@" "$MARKER" <<'PY'
+import glob, json, os, re, sys
+
+mode, caddyfile, host, site_conf, state, MARK = sys.argv[1:7]
+host = host.lower()
+IMPORT_LINE = 'import ' + site_conf
+
+def fail(msg):
+    print(json.dumps({'status': 'error', 'error': msg}, ensure_ascii=False))
+    sys.exit(0)
+
+def scan(text):
+    """أحداث الأقواس خارج النصوص والتعليقات وheredoc: [(رقم السطر، القوس)]"""
+    ev, i, n, line, start = [], 0, len(text), 0, True
+    while i < n:
+        c = text[i]
+        if c == '\n':
+            line += 1; start = True; i += 1; continue
+        if c in ' \t\r':
+            start = True; i += 1; continue
+        if c == '#' and start:
+            j = text.find('\n', i); i = n if j < 0 else j; continue
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == '\\': i += 1
+                elif text[i] == '\n': line += 1
+                i += 1
+            if i >= n: raise ValueError('quoted string without end')
+            i += 1; start = False; continue
+        if c == '`':
+            j = text.find('`', i + 1)
+            if j < 0: raise ValueError('backtick string without end')
+            line += text.count('\n', i, j); i = j + 1; start = False; continue
+        if c == '<' and start and text.startswith('<<', i):
+            m = re.match(r'<<([A-Za-z0-9_-]+)[ \t]*\r?\n', text[i:])
+            if m:
+                marker, j = m.group(1), i + m.end()
+                line += 1
+                # سطر الإغلاق يبدأ بالعلامة وقد تليه وسائط أخرى (مثل: HTML 200)
+                end = re.compile(r'[ \t]*' + re.escape(marker) + r'(?=\s|$)')
+                while True:
+                    k = text.find('\n', j)
+                    seg = text[j:n if k < 0 else k]
+                    e = end.match(seg)
+                    if e:
+                        i = j + e.end(); break
+                    if k < 0: raise ValueError('heredoc without end')
+                    j = k + 1; line += 1
+                start = False; continue
+        if c in '{}':
+            ev.append((line, c))
+        start = False; i += 1
+    return ev
+
+def code_part(s):
+    """السطر دون تعليقه"""
+    out, q = [], False
+    for k, ch in enumerate(s):
+        if ch == '"' and (k == 0 or s[k - 1] != '\\'): q = not q
+        if ch == '#' and not q and (k == 0 or s[k - 1] in ' \t'): break
+        out.append(ch)
+    return ''.join(out).rstrip()
+
+def blocks(text):
+    lines = text.split('\n')
+    res, depth, cur = [], 0, None
+    for ln, ch in scan(text):
+        if ch == '{':
+            if depth == 0: cur = ln
+            depth += 1
+        else:
+            depth -= 1
+            if depth < 0: raise ValueError('extra } at line %d' % (ln + 1))
+            if depth == 0:
+                head = code_part(lines[cur])
+                if head.endswith('{'):
+                    res.append({'start': cur, 'end': ln, 'head': head[:-1].strip()})
+    if depth != 0: raise ValueError('unbalanced braces')
+    return res, lines
+
+def top_imports(text, lines, base_dir):
+    inside = set()
+    for b in blocks(text)[0]:
+        inside.update(range(b['start'], b['end'] + 1))
+    out = []
+    for k, l in enumerate(lines):
+        if k in inside: continue
+        m = re.match(r'\s*import\s+(\S+)', code_part(l))
+        if m:
+            p = m.group(1)
+            if '/' in p or '*' in p or '.' in p:
+                out.append(os.path.join(base_dir, p) if not os.path.isabs(p) else p)
+    return out
+
+def norm(addr):
+    a = addr.strip().lower()
+    scheme = ''
+    m = re.match(r'^(https?)://', a)
+    if m: scheme = m.group(1); a = a[m.end():]
+    a = a.split('/')[0]
+    a = re.sub(r':\d+$', '', a)
+    return scheme, a
+
+def files_to_scan():
+    seen, order, todo = set(), [], [(caddyfile, 0)]
+    while todo:
+        f, d = todo.pop(0)
+        f = os.path.realpath(f)
+        if f in seen or d > 3 or not os.path.isfile(f): continue
+        seen.add(f); order.append(f)
+        text = open(f, encoding='utf-8', newline='').read()
+        b, lines = blocks(text)
+        for pat in top_imports(text, lines, os.path.dirname(f)):
+            for g in sorted(glob.glob(pat)):
+                todo.append((g, d + 1))
+    return order
+
+def analyze():
+    found, already = [], []
+    for f in files_to_scan():
+        text = open(f, encoding='utf-8', newline='').read()
+        try:
+            bl, lines = blocks(text)
+        except ValueError as e:
+            fail('تعذّر فهم %s: %s' % (f, e))
+        if any(code_part(l).strip() == IMPORT_LINE for l in lines):
+            already.append(f)
+        for b in bl:
+            if not b['head'] or b['head'].startswith('('): continue
+            if '{' in b['head'] or '}' in b['head']:
+                fail('سطر عنوان غير مألوف في %s سطر %d' % (f, b['start'] + 1))
+            addrs = [a for a in re.split(r'[,\s]+', b['head']) if a]
+            parsed = [norm(a) for a in addrs]
+            if not any(h == host and s != 'http' for s, h in parsed): continue
+            others = [a for (s, h), a in zip(parsed, addrs) if h not in (host, 'www.' + host)]
+            if others:
+                fail('كتلة %s في %s مشتركة مع عناوين أخرى (%s)؛ عدّلها يدوياً' % (host, f, ', '.join(others)))
+            tail = code_part(lines[b['end']]).strip()
+            if tail != '}':
+                fail('نهاية كتلة %s في %s سطر %d غير مألوفة' % (host, f, b['end'] + 1))
+            found.append({'file': f, 'start': b['start'], 'end': b['end'], 'addresses': ', '.join(addrs)})
+    if already:
+        return {'status': 'already', 'file': already[0], 'others': found}
+    if not found:
+        fail('لم أجد كتلة %s في إعداد Caddy (%s)' % (host, caddyfile))
+    if len(found) > 1:
+        fail('وجدت أكثر من كتلة لـ %s: %s' % (host, ', '.join('%s:%d' % (x['file'], x['start'] + 1) for x in found)))
+    return dict(found[0], status='patch')
+
+def write_like(path, text):
+    st = os.stat(path)
+    tmp = path + '.dalil-hama-site.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='') as fh:
+        fh.write(text)
+    os.chmod(tmp, st.st_mode & 0o7777)
+    try: os.chown(tmp, st.st_uid, st.st_gid)
+    except PermissionError: pass
+    os.replace(tmp, path)
+
+def main():
+    if mode == 'analyze':
+        print(json.dumps(analyze(), ensure_ascii=False))
+    elif mode == 'apply':
+        r = analyze()
+        if r['status'] != 'patch':
+            print(json.dumps(r, ensure_ascii=False)); return
+        text = open(r['file'], encoding='utf-8', newline='').read()
+        lines = text.split('\n')
+        old = '\n'.join(lines[r['start']:r['end'] + 1]) + '\n'
+        indent = re.match(r'[ \t]*', lines[r['start']]).group(0)
+        eol = '\r' if lines[r['start']].endswith('\r') else ''
+        new = lines[:r['start']] + [indent + MARK + eol, indent + IMPORT_LINE + eol] + lines[r['end'] + 1:]
+        with open(os.path.join(state, 'old-block.caddy'), 'w', encoding='utf-8', newline='') as fh:
+            fh.write(old)
+        with open(os.path.join(state, 'patched-file'), 'w', encoding='utf-8', newline='') as fh:
+            fh.write(r['file'] + '\n')
+        write_like(r['file'], '\n'.join(new))
+        print(json.dumps(dict(r, status='patched'), ensure_ascii=False))
+    elif mode == 'unpatch':
+        try:
+            f = open(os.path.join(state, 'patched-file'), encoding='utf-8', newline='').read().strip()
+            old = open(os.path.join(state, 'old-block.caddy'), encoding='utf-8', newline='').read()
+        except OSError:
+            fail('لا توجد نسخة محفوظة من كتلة الموقع القديم')
+        text = open(f, encoding='utf-8', newline='').read()
+        lines = text.split('\n')
+        idx = [k for k, l in enumerate(lines) if code_part(l).strip() == IMPORT_LINE]
+        if len(idx) != 1:
+            fail('لم أجد سطر الموقع الجديد في %s' % f)
+        k = idx[0]
+        a = k - 1 if k > 0 and lines[k - 1].strip() == MARK else k
+        new = lines[:a] + old.rstrip('\n').split('\n') + lines[k + 1:]
+        write_like(f, '\n'.join(new))
+        print(json.dumps({'status': 'unpatched', 'file': f}, ensure_ascii=False))
+
+try:
+    main()
+except (ValueError, OSError, UnicodeDecodeError) as e:
+    fail('تعذّر قراءة إعداد Caddy: %s' % e)
+PY
+}
+
+json_get() { python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get(sys.argv[2],""))' "$1" "$2"; }
+
+write_site_conf() {
+  local addresses=$1 tmp=$SITE_CONF.new
+  mkdir -p "$ETC"; chmod 755 "$ETC"
+  cat > "$tmp" <<EOF
+# دليل حماة — الموقع الجديد (ملفات ثابتة من $BASE/current).
+# يكتب هذا الملفَّ الأمرُ dalil-hama-site عند كل تثبيت؛ أي تعديل يدوي هنا يُستبدل.
+$addresses {
+	root * $BASE/current
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), geolocation=(self), microphone=(self)"
+		Cross-Origin-Opener-Policy "same-origin"
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'sha256-eKTws3IEpyLgPZy+jhsFIc3StBddPnlt4UVAYvIMEKg=' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: blob: https://tile.openstreetmap.org https://cdnjs.cloudflare.com; font-src 'self'; connect-src 'self' https://jhgwzynxkioqfyoldoyx.supabase.co; manifest-src 'self'; worker-src 'self'; frame-src 'none'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; upgrade-insecure-requests"
+		-Server
+	}
+
+	@revalidate path / /index.html /admin/ /admin/index.html /privacy/ /privacy/index.html /sw.js /manifest.webmanifest /release.txt /robots.txt /sitemap.xml *.js *.css
+	header @revalidate Cache-Control "no-cache"
+	@fonts path /assets/fonts/*
+	header @fonts Cache-Control "public, max-age=31536000, immutable"
+	@images path /assets/img/* /favicon.svg
+	header @images Cache-Control "public, max-age=86400"
+	header /manifest.webmanifest Content-Type "application/manifest+json"
+
+	redir /admin /admin/ 308
+	redir /privacy /privacy/ 301
+	respond /health "ok" 200
+
+	file_server
+
+	handle_errors {
+		@missing_page {
+			expression {err.status_code} == 404
+			path_regexp ^/[^.]*$
+		}
+		redir @missing_page / 302
+		respond "{err.status_code} {err.status_text}"
+	}
+}
+EOF
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$SITE_CONF"
+}
+
+install_units() {
+  cat > "$UNIT_DIR/$UNIT.service" <<EOF
+[Unit]
+Description=Dalil Hama: fetch the latest site release
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=$SITE_USER
+Group=$SITE_USER
+ExecStart=$SELF_DST update --quiet
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=$BASE
+EOF
+  cat > "$UNIT_DIR/$UNIT.timer" <<EOF
+[Unit]
+Description=Dalil Hama: check for a new site release every 10 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 644 "$UNIT_DIR/$UNIT.service" "$UNIT_DIR/$UNIT.timer"
+}
+
+ensure_user() {
+  id "$SITE_USER" >/dev/null 2>&1 && return 0
+  useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$SITE_USER" ||
+    die "تعذّر إنشاء المستخدم $SITE_USER"
+}
+
+# ─────────── الأوامر ───────────
+
+cmd_install() {
+  need_root install
+  need_tools curl tar python3 flock find
+  load_conf
+  detect_caddy
+  mkdir -p "$STATE"; chmod 700 "$STATE"
+
+  local self sha ts analysis status file addresses backup
+  self=$(readlink -f "${BASH_SOURCE[0]}")
+  [ -f "$self" ] || die "نزّل الملف أولاً ثم شغّله: sudo bash /tmp/dalil-hama-site install"
+
+  say "١/٤ تنزيل الموقع الجديد من GitHub…"
+  ensure_user
+  take_lock
+  sha=$(remote_sha) || die "تعذّر معرفة آخر إصدار من GitHub ($REPO / $BRANCH)"
+  fetch_release "$sha"
+  activate "$sha"
+  rm -f "$BASE/PINNED"
+  fix_owner
+  ok "الإصدار ${sha:0:7} جاهز في $BASE/current"
+
+  say "٢/٤ تجهيز Caddy…"
+  if [ "$self" != "$(readlink -f "$SELF_DST" 2>/dev/null || true)" ]; then
+    install -m 755 "$self" "$SELF_DST"
+  fi
+  analysis=$(caddy_patch analyze "$CADDYFILE" "$HOST" "$SITE_CONF" "$STATE")
+  status=$(json_get "$analysis" status)
+  [ "$status" = error ] && die "$(json_get "$analysis" error)؛ لم يتغير شيء في Caddy"
+  file=$(json_get "$analysis" file)
+  ts=$(date +%Y%m%d-%H%M%S)
+  backup="$STATE/$(basename "$file").$ts.bak"
+  cp -p -- "$file" "$backup"
+  [ -f "$SITE_CONF" ] && cp -p -- "$SITE_CONF" "$STATE/site.caddy.$ts.bak"
+
+  if [ "$status" = patch ]; then
+    addresses=$(json_get "$analysis" addresses)
+  else
+    # مثبّت من قبل: نُبقي العناوين المكتوبة في الملف الحالي
+    addresses=$(awk '/^[^#[:space:]].*\{[[:space:]]*$/ { sub(/[[:space:]]*\{[[:space:]]*$/, ""); print; exit }' "$SITE_CONF" 2>/dev/null || true)
+    [ -n "$addresses" ] || addresses=$HOST
+  fi
+
+  restore() {
+    cp -p -- "$backup" "$file"
+    if [ -f "$STATE/site.caddy.$ts.bak" ]; then cp -p -- "$STATE/site.caddy.$ts.bak" "$SITE_CONF"; fi
+    caddy_reload || warn "تعذّرت إعادة تحميل Caddy بعد الاسترجاع؛ راجع: systemctl status caddy"
+  }
+
+  write_site_conf "$addresses"
+  if [ "$status" = patch ]; then
+    analysis=$(caddy_patch apply "$CADDYFILE" "$HOST" "$SITE_CONF" "$STATE")
+    if [ "$(json_get "$analysis" status)" != patched ]; then
+      cp -p -- "$backup" "$file"
+      die "$(json_get "$analysis" error)؛ لم يتغير شيء في Caddy"
+    fi
+  fi
+
+  say "٣/٤ فحص الإعداد وتفعيله…"
+  if ! caddy_validate; then
+    cp -p -- "$backup" "$file"
+    [ -f "$STATE/site.caddy.$ts.bak" ] && cp -p -- "$STATE/site.caddy.$ts.bak" "$SITE_CONF"
+    cat "$STATE/validate.log" >&2
+    die "رفض Caddy الإعداد الجديد فأعدت الملف كما كان؛ الموقع القديم يعمل كما هو"
+  fi
+  if ! caddy_reload; then
+    cat "$STATE/reload.log" >&2
+    restore
+    die "تعذّر تفعيل الإعداد الجديد فأعدت كل شيء كما كان؛ الموقع القديم يعمل كما هو"
+  fi
+  if ! wait_served "$sha"; then
+    restore
+    die "Caddy لم يعرض الموقع الجديد خلال 30 ثانية فأعدت كل شيء كما كان؛ الموقع القديم يعمل كما هو"
+  fi
+  ok "النطاق https://$HOST يعرض الآن الموقع الجديد"
+
+  say "٤/٤ تفعيل التحديث التلقائي…"
+  install_units
+  systemctl daemon-reload
+  systemctl enable --now "$UNIT.timer" >/dev/null 2>&1 || warn "تعذّر تفعيل التحديث التلقائي؛ يمكنك التحديث يدوياً: sudo dalil-hama-site update"
+  date -u +%FT%TZ > "$STATE/installed-at"
+
+  say ""
+  ok "تم. الموقع الجديد يعمل على https://$HOST (الإصدار ${sha:0:7})"
+  say "  • يتحدّث تلقائياً كل 10 دقائق من GitHub."
+  say "  • الموقع القديم ما زال يعمل في الخلفية، ولم تُمسّ قاعدة بياناته، ولا يصل إليه الزوار."
+  say "  • للرجوع إلى الموقع القديم فوراً:  sudo dalil-hama-site rollback"
+}
+
+cmd_update() {
+  [ "${1:-}" = --quiet ] && QUIET=1
+  need_tools curl tar flock find
+  load_conf
+  take_lock
+  if [ -f "$BASE/PINNED" ]; then
+    say "التحديث التلقائي موقوف على الإصدار $(cut -c1-7 "$BASE/PINNED"). لاستئنافه: sudo dalil-hama-site resume"
+    return 0
+  fi
+  local sha cur
+  sha=$(remote_sha) || die "تعذّر معرفة آخر إصدار من GitHub ($REPO / $BRANCH)"
+  cur=$(current_sha) || cur=
+  if [ "$sha" = "$cur" ]; then
+    say "الموقع على آخر إصدار (${sha:0:7})"
+  else
+    fetch_release "$sha"
+    activate "$sha"
+    prune
+    fix_owner
+    printf 'dalil-hama-site: %s -> %s\n' "${cur:0:7}" "${sha:0:7}"
+  fi
+}
+
+cmd_previous() {
+  need_root previous
+  take_lock
+  local prev cur
+  prev=$(cat "$BASE/previous" 2>/dev/null) || prev=
+  is_sha "$prev" && [ -d "$BASE/releases/$prev" ] || die "لا يوجد إصدار سابق محفوظ"
+  cur=$(current_sha) || cur=
+  activate "$prev"
+  printf '%s\n' "$prev" > "$BASE/PINNED"
+  fix_owner
+  ok "رجع الموقع إلى الإصدار ${prev:0:7} (كان ${cur:0:7})، وأُوقف التحديث التلقائي."
+  say "  لاستئناف التحديث:  sudo dalil-hama-site resume"
+}
+
+cmd_resume() {
+  need_root resume
+  rm -f "$BASE/PINNED"
+  cmd_update
+}
+
+cmd_rollback() {
+  need_root rollback
+  need_tools python3
+  detect_caddy
+  local r file ts backup
+  [ -f "$STATE/patched-file" ] || die "لا توجد نسخة محفوظة من إعداد الموقع القديم"
+  file=$(cat "$STATE/patched-file")
+  ts=$(date +%Y%m%d-%H%M%S)
+  backup="$STATE/$(basename "$file").$ts.before-rollback.bak"
+  cp -p -- "$file" "$backup"
+  r=$(caddy_patch unpatch "$CADDYFILE" "$HOST" "$SITE_CONF" "$STATE")
+  [ "$(json_get "$r" status)" = unpatched ] || die "$(json_get "$r" error)"
+  if ! caddy_validate || ! caddy_reload; then
+    cp -p -- "$backup" "$file"
+    caddy_reload || true
+    cat "$STATE/validate.log" "$STATE/reload.log" >&2 2>/dev/null || true
+    die "تعذّر تفعيل إعداد الموقع القديم فأبقيت الموقع الجديد كما هو"
+  fi
+  systemctl disable --now "$UNIT.timer" >/dev/null 2>&1 || true
+  systemctl is-active --quiet dalil-hama ||
+    warn "خدمة الموقع القديم dalil-hama متوقفة؛ شغّلها: sudo systemctl start dalil-hama"
+  ok "عاد النطاق https://$HOST إلى الموقع القديم."
+  say "  لإعادة الموقع الجديد لاحقاً:  sudo dalil-hama-site install"
+}
+
+cmd_status() {
+  load_conf
+  local cur served remote
+  cur=$(current_sha) || cur=
+  served=$(served_sha) || served=
+  remote=$(remote_sha) || remote=
+  say "النطاق:            https://$HOST"
+  say "المصدر:            github.com/$REPO ($BRANCH)"
+  say "الإصدار المثبّت:    ${cur:0:7}"
+  if [ -n "$served" ]; then say "الإصدار المعروض:    ${served:0:7}"
+  else say "الإصدار المعروض:    — (النطاق لا يعرض الموقع الجديد)"; fi
+  say "آخر إصدار متاح:     ${remote:0:7}"
+  [ -f "$BASE/PINNED" ] && say "التحديث التلقائي:   موقوف (sudo dalil-hama-site resume)" ||
+    say "التحديث التلقائي:   $(systemctl is-active "$UNIT.timer" 2>/dev/null || echo غير مفعّل)"
+  say "الموقع القديم:      $(systemctl is-active dalil-hama 2>/dev/null || echo غير موجود)"
+}
+
+usage() {
+  sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+case ${1:-} in
+  install)  cmd_install ;;
+  update)   shift; cmd_update "$@" ;;
+  previous) cmd_previous ;;
+  resume)   cmd_resume ;;
+  rollback) cmd_rollback ;;
+  status)   cmd_status ;;
+  *)        usage; exit 2 ;;
+esac

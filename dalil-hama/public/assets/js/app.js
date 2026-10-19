@@ -421,11 +421,16 @@ function loadLeaflet() {
       const css = document.createElement('link');
       css.rel = 'stylesheet';
       css.href = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css';
+      css.integrity = 'sha512-h9FcoyWjHcOcmEVkxOfTLnmZFWIH0iZhZT1H2TbOq55xssQGEJHEaIm+PgoUaZbRvQTNTluNOEfb1ZRy6D3BOw==';
+      css.crossOrigin = 'anonymous';
       document.head.append(css);
       const js = document.createElement('script');
       js.src = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js';
+      js.integrity = 'sha512-puJW3E/qXDqYp9IfhAI54BJEaWIfloJ7JWs7OeD5i6ruC9JZL1gERT1wjtwXFlh7CjE7ZJ+/vcRZRkIYIb6p4g==';
+      js.crossOrigin = 'anonymous';
       js.onload = () => resolve(window.L);
-      js.onerror = reject;
+      // فشل التحميل لا يُحفظ، فتعيد المحاولة التالية الطلب من جديد
+      js.onerror = (err) => { leafletPromise = null; css.remove(); js.remove(); reject(err); };
       document.head.append(js);
     });
   }

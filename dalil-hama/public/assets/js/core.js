@@ -158,9 +158,19 @@ export function fmtDistance(m) {
   return `${fmtNum(Math.round(m / 100) / 10)} كم`;
 }
 
+/** رابط آمن: http(s) فقط، ويُضاف https:// للروابط المكتوبة بلا بروتوكول (facebook.com/...) */
+export function safeUrl(u) {
+  const v = String(u || '').trim();
+  if (!v) return '';
+  try {
+    const x = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(v) ? v : 'https://' + v.replace(/^\/+/, ''));
+    return x.protocol === 'https:' || x.protocol === 'http:' ? x.href : '';
+  } catch { return ''; }
+}
+
 export function mapHref(item) {
   if (item.g) return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(item.n)}&query_place_id=${item.g}`;
-  if (item.m) return item.m;
+  if (item.m) return safeUrl(item.m);
   if (item.y && item.x) return `https://www.google.com/maps/search/?api=1&query=${item.y},${item.x}`;
   return '';
 }

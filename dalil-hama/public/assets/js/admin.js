@@ -1,6 +1,6 @@
 // دليل حماة — لوحة الإدارة
 import {
-  request, ApiError, esc, fmtNum, store, debounce, normalizePhone, formatPhone, isMobile, waHref, telHref, timeAgo, normalize,
+  request, ApiError, esc, fmtNum, store, debounce, normalizePhone, formatPhone, isMobile, waHref, telHref, timeAgo, normalize, safeUrl,
 } from './core.js';
 import { SearchIndex } from './search.js';
 
@@ -24,7 +24,9 @@ const FIELD_LABEL = {
 const auth = {
   session: store.get(SESSION_KEY),
   save(r) {
-    this.session = { access_token: r.access_token, refresh_token: r.refresh_token, expires_at: r.expires_at || Math.floor(Date.now() / 1000) + r.expires_in, email: r.user && r.user.email };
+    // الانتهاء يُحسب بساعة الجهاز نفسه حتى لا يتأثر بفارق التوقيت مع الخادم
+    const exp = r.expires_in ? Math.floor(Date.now() / 1000) + Number(r.expires_in) : r.expires_at;
+    this.session = { access_token: r.access_token, refresh_token: r.refresh_token, expires_at: exp, email: r.user && r.user.email };
     store.set(SESSION_KEY, this.session);
   },
   clear() { this.session = null; store.del(SESSION_KEY); },
@@ -34,6 +36,12 @@ const auth = {
   },
   async refresh() {
     if (!this.session) throw new ApiError('no session', 401);
+    // تبويب آخر جدّد الجلسة: نعتمد جلسته بدلاً من تجديد ثانٍ برمز صار ملغى
+    const s = store.get(SESSION_KEY);
+    if (s && s.refresh_token && s.refresh_token !== this.session.refresh_token) {
+      this.session = s;
+      return;
+    }
     const r = await request('/auth/v1/token?grant_type=refresh_token', { method: 'POST', body: { refresh_token: this.session.refresh_token } });
     this.save(r);
   },
@@ -44,12 +52,24 @@ const auth = {
   },
 };
 
+function sessionExpired() {
+  auth.clear();
+  renderLogin('انتهت الجلسة، سجّل الدخول مجدداً.');
+}
+
 async function api(path, opts = {}, retry = true) {
+  let token;
   try {
-    return await request(path, { ...opts, token: await auth.token() });
+    token = await auth.token();
+  } catch (e) {
+    if (e.status === 400 || e.status === 401) sessionExpired();
+    throw e;
+  }
+  try {
+    return await request(path, { ...opts, token });
   } catch (e) {
     if (e.status === 401 && retry) {
-      try { await auth.refresh(); } catch { auth.clear(); renderLogin('انتهت الجلسة، سجّل الدخول مجدداً.'); throw e; }
+      try { await auth.refresh(); } catch { sessionExpired(); throw e; }
       return api(path, opts, false);
     }
     throw e;
@@ -270,7 +290,7 @@ async function start() {
 // ─────────────── أدوات العرض ───────────────
 
 const catName = (id) => (A.catById.get(id) || {}).name || 'بلا تصنيف';
-const catIcon = (id) => (A.catById.get(id) || {}).icon || '📍';
+const catIcon = (id) => esc((A.catById.get(id) || {}).icon || '📍');
 const catHue = (id) => { const c = A.catById.get(id); return c ? (c.sort * 4.7 + c.id * 31) % 360 : 170; };
 const phonesHtml = (r) => (r.phones || []).map((p) => `<bdi dir="ltr">${esc(formatPhone(p))}</bdi>`).join(' · ') || '<span style="color:var(--danger)">بلا رقم</span>';
 const st = (s, map = STATUS) => `<span class="st ${s}">${map[s] || s}</span>`;
@@ -317,14 +337,19 @@ function closeSheet() {
   sheet = null;
   document.documentElement.style.overflow = '';
 }
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && sheet) closeSheet(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && sheet && !document.querySelector('dialog[open]')) closeSheet();
+});
 
 function confirmBox(msg, { ok = 'تأكيد', danger = false } = {}) {
   return new Promise((resolve) => {
-    const sh = openSheet('تأكيد', `<p style="margin:0 0 18px;font-size:16px">${msg}</p><div style="display:flex;gap:8px"><button class="btn ${danger ? 'btn-danger' : 'btn-primary'}" style="flex:1" data-ok>${ok}</button><button class="btn btn-soft" style="flex:1" data-no>إلغاء</button></div>`, { wide: false });
-    sh.querySelector('[data-ok]').onclick = () => { closeSheet(); resolve(true); };
-    sh.querySelector('[data-no]').onclick = () => { closeSheet(); resolve(false); };
-    sh.querySelector('[data-close]').addEventListener('click', () => resolve(false));
+    const d = document.createElement('dialog');
+    d.className = 'confirm';
+    d.innerHTML = `<p>${msg}</p><form method="dialog" class="confirm-ops"><button value="ok" class="btn ${danger ? 'btn-danger' : 'btn-primary'}">${ok}</button><button value="" class="btn btn-soft">إلغاء</button></form>`;
+    document.body.append(d);
+    d.addEventListener('close', () => { resolve(d.returnValue === 'ok'); d.remove(); });
+    d.addEventListener('click', (e) => { if (e.target === d) d.close(''); });
+    d.showModal();
   });
 }
 
@@ -378,12 +403,17 @@ const inHama = (lat, lng) => lat > 34.95 && lat < 35.35 && lng > 36.55 && lng < 
 
 /** يستخرج الإحداثيات والاسم من رابط خرائط أو عنوان فيه Plus Code */
 function parseMap(text) {
-  const u = decodeURIComponent(String(text || '').replace(/\+/g, ' '));
+  const raw = String(text || '');
+  let u;
+  try { u = decodeURIComponent(raw.replace(/\+/g, ' ')); } catch { u = raw.replace(/\+/g, ' '); }
   const out = { lat: null, lng: null, name: '' };
   const m1 = u.match(/@(-?\d+\.\d+),\s*(-?\d+\.\d+)/) || u.match(/[?&](?:q|query|ll|daddr|destination)=(-?\d+\.\d+),\s*(-?\d+\.\d+)/) || u.match(/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/);
   if (m1) { out.lat = +m1[1]; out.lng = +m1[2]; }
   if (out.lat === null) {
-    const pc = u.match(/\b([23456789CFGHJMPQRVWX]{4,8}\+[23456789CFGHJMPQRVWX]{2,3})\b/i);
+    const PCX = /\b([23456789CFGHJMPQRVWX]{4,8}\+[23456789CFGHJMPQRVWX]{2,3})\b/i;
+    let dec = raw;
+    try { dec = decodeURIComponent(raw); } catch { /* keep raw */ }
+    const pc = raw.match(PCX) || dec.match(PCX);
     if (pc) [out.lat, out.lng] = olcRecover(pc[1]);
   }
   if (out.lat !== null && !inHama(out.lat, out.lng)) { out.lat = null; out.lng = null; }
@@ -456,7 +486,7 @@ function viewPending(el) {
       <dl class="kv">
         <dt>الأرقام</dt><dd>${phonesHtml(r)}</dd>
         ${r.area || r.address ? `<dt>العنوان</dt><dd>${esc([r.area, r.address].filter(Boolean).join('، '))}</dd>` : ''}
-        ${r.map_url ? `<dt>الخريطة</dt><dd><a href="${esc(r.map_url)}" target="_blank" rel="noopener" style="color:var(--brand)">فتح الرابط</a></dd>` : ''}
+        ${safeUrl(r.map_url) ? `<dt>الخريطة</dt><dd><a href="${esc(safeUrl(r.map_url))}" target="_blank" rel="noopener" style="color:var(--brand)">فتح الرابط</a></dd>` : ''}
         ${r.website ? `<dt>الموقع</dt><dd dir="ltr" style="text-align:right">${esc(r.website)}</dd>` : ''}
         ${r.description ? `<dt>النبذة</dt><dd>${esc(r.description)}</dd>` : ''}
         ${r.submitter_name || r.submitter_phone ? `<dt>المُرسِل</dt><dd>${esc(r.submitter_name || '')} ${r.submitter_phone ? `<bdi dir="ltr">${esc(r.submitter_phone)}</bdi>` : ''}</dd>` : ''}
@@ -563,7 +593,7 @@ function viewListings(el) {
   el.innerHTML = `<div class="toolbar">
       <input class="input grow" id="f-q" type="search" placeholder="ابحث بالاسم أو الرقم أو العنوان…" value="${esc(f.q)}">
       <select class="input" id="f-status"><option value="all">كل الحالات</option>${Object.entries(STATUS).map(([k, v]) => `<option value="${k}"${f.status === k ? ' selected' : ''}>${v}</option>`).join('')}</select>
-      <select class="input" id="f-cat"><option value="">كل التصنيفات</option>${A.cats.map((c) => `<option value="${c.id}"${String(f.cat) === String(c.id) ? ' selected' : ''}>${c.icon} ${esc(c.name)}</option>`).join('')}</select>
+      <select class="input" id="f-cat"><option value="">كل التصنيفات</option>${A.cats.map((c) => `<option value="${c.id}"${String(f.cat) === String(c.id) ? ' selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('')}</select>
       <select class="input" id="f-area"><option value="">كل الأحياء</option><option value="__none"${f.area === '__none' ? ' selected' : ''}>بلا حي</option>${A.areas.map((a) => `<option${f.area === a.name ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
       <select class="input" id="f-flag"><option value="">كل البيانات</option>
         <option value="nophone"${f.flag === 'nophone' ? ' selected' : ''}>بلا رقم</option><option value="noloc"${f.flag === 'noloc' ? ' selected' : ''}>بلا موقع</option>
@@ -587,7 +617,7 @@ function viewListings(el) {
   const drawBulk = () => {
     const n = A.selected.size;
     $('#bulk').innerHTML = n ? `<div class="bulk"><b>${fmtNum(n)} محدد</b>
-      <select class="input" id="b-cat"><option value="">نقل إلى تصنيف…</option>${A.cats.map((c) => `<option value="${c.id}">${c.icon} ${esc(c.name)}</option>`).join('')}</select>
+      <select class="input" id="b-cat"><option value="">نقل إلى تصنيف…</option>${A.cats.map((c) => `<option value="${c.id}">${esc(c.icon)} ${esc(c.name)}</option>`).join('')}</select>
       <select class="input" id="b-area"><option value="">تعيين الحي…</option>${A.areas.map((a) => `<option>${esc(a.name)}</option>`).join('')}</select>
       <select class="input" id="b-status"><option value="">تغيير الحالة…</option>${Object.entries(STATUS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
       <button class="btn btn-danger" id="b-del">${I('trash', 'sm')}حذف</button>
@@ -648,12 +678,12 @@ function editListing(id, preset = {}) {
   const body = `<form class="form" id="edit-form" novalidate>
     <div class="form-grid two">
       <label class="field full"><span>الاسم <i>*</i></span><input class="input" name="name" required maxlength="160" value="${esc(r.name)}"></label>
-      <label class="field"><span>التصنيف</span><select class="input" name="category_id"><option value="">بلا تصنيف</option>${A.cats.map((c) => `<option value="${c.id}"${r.category_id === c.id ? ' selected' : ''}>${c.icon} ${esc(c.name)}</option>`).join('')}</select></label>
+      <label class="field"><span>التصنيف</span><select class="input" name="category_id"><option value="">بلا تصنيف</option>${A.cats.map((c) => `<option value="${c.id}"${r.category_id === c.id ? ' selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('')}</select></label>
       <label class="field"><span>الحالة</span><select class="input" name="status">${Object.entries(STATUS).map(([k, v]) => `<option value="${k}"${r.status === k ? ' selected' : ''}>${v}</option>`).join('')}</select></label>
       <div class="field full"><span>الأرقام <em>(الأول هو الأساسي)</em></span><div class="phones-edit" id="phones">${phones.map((p) => phoneInput(p)).join('')}</div>
         <button class="btn btn-ghost" type="button" id="add-phone" style="justify-self:start">${I('plus', 'sm')}رقم آخر</button></div>
       <label class="field"><span>رقم واتساب مختلف <em>(اختياري)</em></span><input class="input" name="whatsapp" dir="ltr" value="${esc(r.whatsapp || '')}" placeholder="تلقائياً: أول رقم جوال"></label>
-      <label class="field"><span>الحي</span><select class="input" name="area"><option value="">—</option>${A.areas.map((a) => `<option${r.area === a.name ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
+      <label class="field"><span>الحي</span><select class="input" name="area"><option value="">—</option>${r.area && !A.areas.some((a) => a.name === r.area) ? `<option selected>${esc(r.area)}</option>` : ''}${A.areas.map((a) => `<option${r.area === a.name ? ' selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
       <label class="field full"><span>العنوان</span><input class="input" name="address" maxlength="400" value="${esc(r.address || '')}"></label>
       <div class="field full"><span>رابط الخريطة</span><div style="display:flex;gap:8px"><input class="input" name="map_url" dir="ltr" maxlength="1200" value="${esc(r.map_url || '')}" style="flex:1"><button class="btn btn-soft" type="button" id="parse-map">استخراج الإحداثيات</button></div></div>
       <label class="field"><span>خط العرض</span><input class="input" name="lat" dir="ltr" inputmode="decimal" value="${r.lat ?? ''}"></label>
@@ -714,10 +744,10 @@ function editListing(id, preset = {}) {
       whatsapp: normalizePhone(fd.get('whatsapp')) || null,
       area: fd.get('area') || null,
       address: fd.get('address').trim() || null,
-      map_url: fd.get('map_url').trim() || null,
+      map_url: safeUrl(fd.get('map_url')) || null,
       lat: num(fd.get('lat')),
       lng: num(fd.get('lng')),
-      website: fd.get('website').trim() || null,
+      website: safeUrl(fd.get('website')) || null,
       tags: fd.get('tags').split(/[،,]/).map((t) => t.trim()).filter(Boolean),
       description: fd.get('description').trim() || null,
       admin_note: fd.get('admin_note').trim() || null,
@@ -897,7 +927,7 @@ function viewCats(el) {
       const n = counts.get(id) || 0;
       const other = A.cats.filter((c) => c.id !== id);
       const sh = openSheet('حذف تصنيف', `<p style="margin-top:0">${n ? `يحتوي هذا التصنيف على ${fmtNum(n)} نشاطاً. اختر تصنيفاً تُنقل إليه قبل الحذف:` : 'هل تريد حذف هذا التصنيف؟'}</p>
-        ${n ? `<select class="input" id="move-to">${other.map((c) => `<option value="${c.id}">${c.icon} ${esc(c.name)}</option>`).join('')}</select>` : ''}
+        ${n ? `<select class="input" id="move-to">${other.map((c) => `<option value="${c.id}">${esc(c.icon)} ${esc(c.name)}</option>`).join('')}</select>` : ''}
         <div style="display:flex;gap:8px;margin-top:16px"><button class="btn btn-danger" style="flex:1" id="do-del">حذف</button><button class="btn btn-soft" style="flex:1" data-close2>إلغاء</button></div>`, { wide: false });
       sh.querySelector('[data-close2]').onclick = closeSheet;
       sh.querySelector('#do-del').onclick = async () => {
@@ -981,7 +1011,11 @@ const CSV_COLS = [
 ];
 
 function toCsv(rows) {
-  const q = (v) => { const s = String(v ?? ''); return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  const q = (v) => {
+    let s = String(v ?? '');
+    if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
   return '﻿' + [CSV_COLS.map((c) => c[0]).join(','), ...rows.map((r) => CSV_COLS.map(([, f]) => q(f(r))).join(','))].join('\r\n');
 }
 
@@ -1007,7 +1041,7 @@ function parseCsv(text) {
   row.push(cell);
   if (row.some((c) => c.trim())) rows.push(row);
   const head = rows.shift() || [];
-  return rows.map((r) => Object.fromEntries(head.map((h, i) => [h.trim(), (r[i] || '').trim()])));
+  return rows.map((r) => Object.fromEntries(head.map((h, i) => [h.trim(), (r[i] || '').trim().replace(/^'(?=[=+\-@\t\r])/, '')])));
 }
 
 function download(name, content, type) {
@@ -1039,15 +1073,16 @@ function viewIO(el) {
       const old = 'الرقم' in r;
       const phones = [r['الأرقام'], r['الرقم'], r['جوال إضافي'], r['أرقام إضافية']].filter(Boolean).join('/').split(/[/،,;|]/).map(normalizePhone).filter(Boolean);
       const id = Number(r['المعرف']) || null;
+      if (old && id && A.byId.has(id)) return null;
       const st0 = r['الحالة'];
       const o = {
         name: (r['الاسم'] || '').replace(/\s+/g, ' ').trim(),
         category_id: catByName.get(normalize(r['التصنيف'] || '')) || (other && other.id) || null,
         phones: [...new Set(phones)],
-        area: r['الحي'] || null,
-        address: (old ? r['العنوان'] : r['العنوان']) || null,
-        map_url: (old ? r['الرابط'] : r['رابط الخريطة']) || null,
-        website: (old ? r['موقع إلكتروني'] : r['الموقع الإلكتروني']) || null,
+        ...('الحي' in r ? { area: r['الحي'] || null } : {}),
+        address: r['العنوان'] || null,
+        map_url: safeUrl(old ? r['الرابط'] : r['رابط الخريطة']) || null,
+        website: safeUrl(old ? r['موقع إلكتروني'] : r['الموقع الإلكتروني']) || null,
         status: STATUS[st0] ? st0 : (Object.entries(STATUS).find(([, v]) => v === st0) || ['approved'])[0],
         source: 'import',
       };
@@ -1067,10 +1102,11 @@ function viewIO(el) {
       if (id) o.id = id;
       if (!catByName.has(normalize(r['التصنيف'] || '')) && id && A.byId.has(id)) delete o.category_id;
       return o;
-    }).filter((o) => o.name.length >= 2);
+    }).filter((o) => o && o.name.length >= 2);
+    const skipped = rows.filter((r) => 'الرقم' in r && A.byId.has(Number(r['المعرف']))).length;
     const updates = mapped.filter((o) => o.id && A.byId.has(o.id));
     const inserts = mapped.filter((o) => !(o.id && A.byId.has(o.id)));
-    $('#import-preview').innerHTML = `<div class="warnbox mt">${I('info', 'sm')}الملف يحتوي ${fmtNum(mapped.length)} نشاطاً: ${fmtNum(updates.length)} للتحديث و${fmtNum(inserts.length)} جديد.</div>
+    $('#import-preview').innerHTML = `<div class="warnbox mt">${I('info', 'sm')}الملف يحتوي ${fmtNum(mapped.length + skipped)} نشاطاً: ${fmtNum(updates.length)} للتحديث و${fmtNum(inserts.length)} جديد${skipped ? `، و${fmtNum(skipped)} موجود مسبقاً في الدليل سيُتجاهل (ملف الدليل القديم لا يُحدِّث البيانات المنظّفة)` : ''}.</div>
       <div class="toolbar mt"><button class="btn btn-primary" id="do-import">${I('upload', 'sm')}تنفيذ الاستيراد</button></div>`;
     $('#do-import').onclick = async (e) => {
       e.target.disabled = true;
@@ -1105,10 +1141,11 @@ function viewIO(el) {
       }
     };
   };
-  $('#file').onchange = (e) => e.target.files[0] && handle(e.target.files[0]);
+  const safeHandle = (file) => handle(file).catch((err) => toast(`تعذّرت قراءة الملف: ${errMsg(err)}`, true));
+  $('#file').onchange = (e) => e.target.files[0] && safeHandle(e.target.files[0]);
   drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
   drop.addEventListener('dragleave', () => drop.classList.remove('over'));
-  drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); if (e.dataTransfer.files[0]) handle(e.dataTransfer.files[0]); });
+  drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); if (e.dataTransfer.files[0]) safeHandle(e.dataTransfer.files[0]); });
 }
 
 // ─────────────── السجل ───────────────

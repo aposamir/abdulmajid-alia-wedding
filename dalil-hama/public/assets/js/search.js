@@ -25,7 +25,14 @@ const SYNONYMS = {
   حلاق: 'حلاق', كوافيره: 'كوافير', صالون: 'حلاق', تكسي: 'تكسي', سرفيس: 'نقل', جوال: 'موبايل', خلوي: 'موبايل',
   تلفون: 'موبايل', لابتوب: 'كمبيوتر', محامي: 'محامي', مهندس: 'مهندس', سمان: 'بقاليه', بقال: 'بقاليه', ماركت: 'بقاليه',
   جامع: 'مسجد', صراف: 'صرافه', حواله: 'حوالات', بنزين: 'محروقات', كازيه: 'محروقات', فندق: 'فندق', صيدلاني: 'صيدليه',
+  ميكانيكي: 'ميكانيك', تاكسي: 'تكسي', دكاتر: 'طبيب', اطباء: 'طبيب', اركيله: 'مقهى', اراكيل: 'مقهى',
 };
+
+/** المرادف للكلمة كما كُتبت أو بعد التجذيع («السمان»، «سمانة»، «الكازية»...) */
+function synonym(t) {
+  const st = stem(t);
+  return SYNONYMS[t] || SYNONYMS[st] || SYNONYMS[st + 'ه'];
+}
 
 export class SearchIndex {
   constructor() {
@@ -39,7 +46,11 @@ export class SearchIndex {
     this.cats = new Map(cats.map((c) => [c.i, c]));
     this.catTokens = cats.map((c) => ({
       id: c.i,
-      stems: [...new Set([...tokens(c.n), ...tokens(c.k || '')].map(stem))],
+      // «عيادات وأطباء»: تُفهرس «أطباء» أيضاً من دون واو العطف
+      stems: [...new Set([
+        ...tokens(c.n).flatMap((t, j) => (j && t.length > 3 && t[0] === 'و' ? [t, t.slice(1)] : [t])),
+        ...tokens(c.k || ''),
+      ].map(stem))],
     }));
     this.areaNames = areas.map((a) => ({ name: a.n, norm: normalize(a.n), stems: tokens(a.n).map(stem) }));
     for (const it of items) this.prepare(it);
@@ -77,7 +88,7 @@ export class SearchIndex {
 
     const raw = tokens(q).filter((t) => !STOP.has(t));
     const terms = (raw.length ? raw : tokens(q)).slice(0, 6);
-    const stems = terms.map((t) => stem(SYNONYMS[t] ? normalize(SYNONYMS[t]) : t));
+    const stems = terms.map((t) => { const syn = synonym(t); return stem(syn ? normalize(syn) : t); });
     const origStems = terms.map(stem);
 
     // التصنيفات والأحياء المطابقة لكل كلمة
@@ -106,12 +117,15 @@ export class SearchIndex {
         let sc = 0;
         for (const tk of it._tok) {
           if (tk === s) { sc = Math.max(sc, 12); break; }
-          if (s.length >= 2 && tk.startsWith(s)) sc = Math.max(sc, 8);
+          if ((s.length >= 2 || stems.length === 1) && tk.startsWith(s)) sc = Math.max(sc, 8);
         }
         if (!sc && s.length >= 3 && it._nn.includes(s)) sc = 5;
         if (catHits[i].has(it.c)) sc = sc ? sc + 4 : 8;
+        // الكلمة تدل على تصنيف والنشاط من تصنيف آخر: تطابق الاسم عَرَضي («دكتور بطاطا» ليس طبيباً)
+        else if (sc && catHits[i].size) sc = Math.min(sc, 7);
         if (!sc && areaHits[i].has(it.a)) sc = 5;
-        if (!sc && s.length >= 2 && it._ext.some((x) => x.startsWith(s))) sc = 3;
+        // كلمة تدل على تصنيف لا تكفيها مطابقة العنوان («مقابل صيدلية...» ليس صيدلية)
+        if (!sc && !catHits[i].size && s.length >= 2 && it._ext.some((x) => x.startsWith(s))) sc = 3;
         if (!sc) { ok = false; break; }
         total += sc;
       }
@@ -130,10 +144,14 @@ export class SearchIndex {
       fuzzy = true;
       for (const it of pool) {
         let total = 0;
-        for (const s of origStems) {
+        for (let i = 0; i < origStems.length; i++) {
+          const s = origStems[i];
           if (s.length < 3) continue;
-          if (it._tok.some((tk) => tk.startsWith(s) || (s.length >= 4 && near(tk, s)))) total += 6;
-          else if (it._ext.some((x) => x.startsWith(s))) total += 2;
+          if (catHits[i].has(it.c)) total += 8;
+          else if (it._tok.some((tk) => tk.startsWith(s))) total += catHits[i].size ? 3 : 6;
+          else if (areaHits[i].has(it.a)) total += 4;
+          else if (s.length >= 5 && it._tok.some((tk) => near(tk, s))) total += 3;
+          else if (it._ext.some((x) => x.startsWith(s))) total += 1;
         }
         if (total) scored.push([total + (it._hasPhone ? 1 : 0) + it._pop, it]);
       }
@@ -188,7 +206,7 @@ export function highlight(text, terms) {
   let last = 0;
   for (const [a, b] of ranges) {
     const oa = map[a];
-    const ob = b < map.length ? map[b] : text.length;
+    const ob = b < map.length ? map[b] : map[b - 1] + 1;
     if (oa < last) continue;
     out += esc(text.slice(last, oa)) + '<mark>' + esc(text.slice(oa, ob)) + '</mark>';
     last = ob;

@@ -197,7 +197,9 @@ def detect_area(address):
 # ─────────────── التصنيف ───────────────
 
 CAT_NAMES = [c[0] for c in CATEGORIES]
-RULES = [(re.compile(p, re.I), c) for p, c in RECLASSIFY_RULES]
+# الأنماط تُطبَّع بالطريقة نفسها التي تُطبَّع بها الأسماء (ى→ي، ئ→ي، ؤ→و، أ/إ/آ→ا)
+_PN = str.maketrans("ىئؤأإآ", "ييوااا")
+RULES = [(re.compile(p.translate(_PN), re.I), c) for p, c in RECLASSIFY_RULES]
 
 
 def classify(old_cat, name):

@@ -1,10 +1,9 @@
 // دليل حماة — الواجهة العامة
 import {
   rpc, esc, formatPhone, isMobile, telHref, waHref, fmtNum, debounce, store,
-  distance, fmtDistance, mapHref, normalizePhone,
+  distance, fmtDistance, mapHref, normalizePhone, safeUrl,
 } from './core.js';
 import { SearchIndex, highlight } from './search.js';
-import { SITE_URL } from './config.js';
 
 const ICONS = '/assets/img/icons.svg';
 const I = (name, cls = '') => `<svg class="ico ${cls}" aria-hidden="true"><use href="${ICONS}#${name}"/></svg>`;
@@ -34,8 +33,8 @@ const state = {
 // ─────────────── البيانات والمزامنة ───────────────
 
 function applyData(data) {
-  state.cats = data.cats;
-  state.catById = new Map(data.cats.map((c) => [c.i, c]));
+  state.cats = data.cats.map((c) => ({ ...c, ic: esc(c.ic || '📍') }));
+  state.catById = new Map(state.cats.map((c) => [c.i, c]));
   state.areas = data.areas;
   state.settings = data.settings || {};
   state.items = data.items;
@@ -74,7 +73,7 @@ async function loadData() {
       next = { ...res, items: [...map.values()].sort((a, b) => a.i - b.i), fullAt: cached.fullAt };
       if (!res.items.length && !res.removed.length && JSON.stringify(res.cats) === JSON.stringify(cached.cats)
         && JSON.stringify(res.settings) === JSON.stringify(cached.settings)) {
-        store.set(CACHE_KEY, { ...cached, now: res.now });
+        store.set(CACHE_KEY, { ...strip(cached), now: res.now });
         return;
       }
     }
@@ -163,7 +162,11 @@ function sync() {
   });
 }
 
-window.addEventListener('popstate', sync);
+window.addEventListener('popstate', () => {
+  const q = params().q;
+  if (input.value.trim() !== q) input.value = q;
+  sync();
+});
 
 // ─────────────── الرسم ───────────────
 
@@ -233,12 +236,12 @@ function renderChrome() {
     .map((c) => `<a class="chip-hero" href="/?c=${c.i}" data-cat="${c.i}"><span aria-hidden="true">${c.ic}</span>${esc(QUICK.find((x) => x[0] === c.n)[1])}</a>`).join('');
   const an = state.settings.announcement;
   $('#announce').innerHTML = an && an.active && an.text
-    ? `<div class="announce">${I('megaphone')}<div>${esc(an.text)}${an.link ? ` <a class="lnk" href="${esc(an.link)}" target="_blank" rel="noopener" style="color:var(--brand);font-weight:700">التفاصيل</a>` : ''}</div></div>` : '';
+    ? `<div class="announce">${I('megaphone')}<div>${esc(an.text)}${safeUrl(an.link) ? ` <a class="lnk" href="${esc(safeUrl(an.link))}" target="_blank" rel="noopener" style="color:var(--brand);font-weight:700">التفاصيل</a>` : ''}</div></div>` : '';
   const c = state.settings.contact || {};
   $('#socials').innerHTML = [
     c.whatsapp && `<a href="${waHref(c.whatsapp)}" target="_blank" rel="noopener">${I('wa')}واتساب</a>`,
     c.instagram && `<a href="https://instagram.com/${esc(c.instagram)}" target="_blank" rel="noopener">${I('ig')}إنستغرام</a>`,
-    c.facebook && `<a href="${esc(c.facebook)}" target="_blank" rel="noopener">${I('fb')}فيسبوك</a>`,
+    safeUrl(c.facebook) && `<a href="${esc(safeUrl(c.facebook))}" target="_blank" rel="noopener">${I('fb')}فيسبوك</a>`,
     `<button type="button" data-act="share-site">${I('share')}شارك الدليل</button>`,
   ].filter(Boolean).join('');
   updateFavDot();
@@ -345,6 +348,9 @@ function renderList(p, mode) {
   if (mode === 'near' && !state.geo) {
     extra = `<div class="empty"><div class="big">📍</div><h3>أين أنت الآن؟</h3><p>اسمح بالوصول إلى موقعك لنرتب لك الصيدليات والعيادات والمحلات حسب الأقرب إليك. لا نحفظ موقعك على خوادمنا.</p>
       <div class="row"><button class="btn btn-primary btn-lg" type="button" data-act="locate">${I('locate')}حدّد موقعي</button></div></div>`;
+  } else if (mode === 'near' || (sort === 'near' && state.geo)) {
+    extra = `<div class="geo-bar"><span>${I('locate', 'sm')}المسافات من موقعك ${geoStale() ? 'السابق' : 'الحالي'}</span><button class="btn btn-soft" type="button" data-act="locate">${I('refresh', 'sm')}تحديث موقعي</button></div>`;
+    if (geoStale() && !state.geoTried) { state.geoTried = true; locate(true); }
   }
   if (res.cats && res.cats.length && p.q && !p.c) {
     extra += `<div class="cat-suggest">${res.cats.map((id) => state.catById.get(id)).filter(Boolean).map((c) => `<a href="/?c=${c.i}">${c.ic} كل ${esc(c.n)} <small>(${fmtNum(state.counts.get(c.i) || 0)})</small></a>`).join('')}</div>`;
@@ -359,8 +365,9 @@ function renderList(p, mode) {
     ${extra}
     ${p.m && mode !== 'favs' ? '<div class="map-box" id="map"></div>' : '<div class="list" id="list"></div><div class="sentinel" id="sentinel"></div>'}`;
 
+  scheduleSearchLog(p.q, list.length);
   if (!list.length && !(mode === 'near' && !state.geo)) {
-    $('#list').outerHTML = emptyState(mode, p);
+    ($('#list') || $('#map')).outerHTML = emptyState(mode, p);
     return;
   }
   if (p.m && mode !== 'favs') renderMap(list);
@@ -369,7 +376,6 @@ function renderList(p, mode) {
     io.disconnect();
     io.observe($('#sentinel'));
   }
-  scheduleSearchLog(p.q, list.length);
 }
 
 function emptyState(mode, p) {
@@ -569,7 +575,7 @@ function openItem(id) {
     ${it.d || it.a || map ? `<div class="block"><p class="block-title">العنوان والموقع</p>
       <div class="info-row">${I('pin')}<div class="grow">${esc(it.d || (it.a ? `حماة، ${it.a}` : 'حماة'))}${d !== null ? `<div class="meta"><span class="dist">يبعد عنك ${fmtDistance(d)}</span></div>` : ''}</div>
       ${map ? `<a class="btn btn-soft" href="${esc(map)}" target="_blank" rel="noopener" data-act="map">${I('map', 'sm')}الخريطة</a>` : ''}</div></div>` : ''}
-    ${it.s ? `<div class="block"><div class="info-row">${I('globe')}<div class="grow"><a class="lnk" href="${esc(it.s)}" target="_blank" rel="noopener" dir="ltr">${esc(it.s.replace(/^https?:\/\//, '').replace(/\/$/, ''))}</a></div></div></div>` : ''}
+    ${safeUrl(it.s) ? `<div class="block"><div class="info-row">${I('globe')}<div class="grow"><a class="lnk" href="${esc(safeUrl(it.s))}" target="_blank" rel="noopener" dir="ltr">${esc(it.s.replace(/^https?:\/\//, '').replace(/\/$/, ''))}</a></div></div></div>` : ''}
     ${it.e ? `<div class="block"><p class="block-title">نبذة</p><div class="info-row">${I('info')}<div class="grow">${esc(it.e)}</div></div></div>` : ''}
     <div class="detail-actions">
       <button class="qa" type="button" data-act="fav" aria-pressed="${state.favs.has(it.i)}">${I('heart')}المفضلة</button>
@@ -631,6 +637,10 @@ function openAdd() {
     btn.textContent = 'جارٍ الإرسال…';
     try {
       delete fd.consent;
+      fd.phone = normalizePhone(fd.phone);
+      fd.phone2 = normalizePhone(fd.phone2);
+      fd.map_url = safeUrl(fd.map_url);
+      fd.website = safeUrl(fd.website);
       const res = await rpc('submit_listing', { payload: fd });
       if (!res.ok) {
         btn.disabled = false;
@@ -740,7 +750,7 @@ function itemText(it) {
 }
 
 async function share(it) {
-  const url = `${SITE_URL}?l=${it.i}`;
+  const url = `${location.origin}/?l=${it.i}`;
   const text = `${it.n}${it.p ? ` — ${it.p[0]}` : ''}\nمن دليل حماة:`;
   track(it.i, 'share');
   if (navigator.share) {
@@ -769,18 +779,21 @@ function updateFavDot() {
   dot.textContent = state.favs.size > 99 ? '99+' : state.favs.size;
 }
 
-function locate() {
+const GEO_MAX_AGE = 10 * 60 * 1000;
+const geoStale = () => !state.geo || Date.now() - (state.geo.at || 0) > GEO_MAX_AGE;
+
+function locate(quiet = false) {
   if (!navigator.geolocation) { toast('المتصفح لا يدعم تحديد الموقع'); return; }
-  toast('جارٍ تحديد موقعك…');
+  if (!quiet) toast('جارٍ تحديد موقعك…');
   navigator.geolocation.getCurrentPosition((pos) => {
-    state.geo = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+    state.geo = { lat: pos.coords.latitude, lng: pos.coords.longitude, at: Date.now() };
     store.set('dh:geo', state.geo);
     state.viewKey = '';
     sync();
     const far = distance(state.geo.lat, state.geo.lng, 35.1318, 36.7578) > 40000;
-    toast(far ? 'يبدو أنك خارج حماة، رتّبنا لك حسب الأقرب على أي حال' : 'تم تحديد موقعك ✓');
+    if (!quiet || far) toast(far ? 'يبدو أنك خارج حماة، رتّبنا لك حسب الأقرب على أي حال' : 'تم تحديد موقعك ✓');
   }, (err) => {
-    toast(err.code === 1 ? 'يرجى السماح بالوصول إلى الموقع من إعدادات المتصفح' : 'تعذّر تحديد الموقع، حاول مجدداً');
+    if (!quiet) toast(err.code === 1 ? 'يرجى السماح بالوصول إلى الموقع من إعدادات المتصفح' : 'تعذّر تحديد الموقع، حاول مجدداً');
   }, { enableHighAccuracy: true, timeout: 12000, maximumAge: 120000 });
 }
 
@@ -799,7 +812,7 @@ document.addEventListener('click', (e) => {
   if (actName === 'share' && it) { e.preventDefault(); share(it); return; }
   if (actName === 'share-site') {
     e.preventDefault();
-    const d = { title: 'دليل حماة', text: 'كل أرقام وعناوين حماة بين يديك 🌿', url: SITE_URL };
+    const d = { title: 'دليل حماة', text: 'كل أرقام وعناوين حماة بين يديك 🌿', url: `${location.origin}/` };
     if (navigator.share) navigator.share(d).catch(() => {}); else copy(`${d.text}\n${d.url}`, 'تم نسخ رابط الدليل');
     return;
   }
@@ -819,7 +832,7 @@ document.addEventListener('click', (e) => {
     return;
   }
   if (actName === 'toggle-map') { e.preventDefault(); go({ m: !params().m }, { keep: true, push: false }); return; }
-  if (actName === 'locate') { e.preventDefault(); locate(); return; }
+  if (actName === 'locate') { e.preventDefault(); state.geoTried = true; locate(); return; }
   if (actName === 'here') {
     e.preventDefault();
     navigator.geolocation?.getCurrentPosition((pos) => {
@@ -834,6 +847,8 @@ document.addEventListener('click', (e) => {
   if (a && !e.defaultPrevented && !(e.ctrlKey || e.metaKey || e.shiftKey) && a.origin === location.origin && !a.target) {
     const u = new URL(a.href);
     if (u.pathname !== '/' && u.pathname !== '/index.html') return;
+    const raw = a.getAttribute('href');
+    if (raw.startsWith('#') && !/^#(add|report|addphone)(-\d+)?$/.test(raw)) return;
     e.preventDefault();
     const sp = u.searchParams;
     const next = {
@@ -843,7 +858,16 @@ document.addEventListener('click', (e) => {
     if (u.hash && !u.search && a.getAttribute('href').startsWith('#')) {
       go({ hash: u.hash.slice(1), l: null }, { keep: true, push: !history.state?.sheet });
     } else {
-      if (sheetEls) { hideSheet(); history.replaceState({ ...(history.state || {}), sheet: false }, '', urlFor({ ...params(), l: null, hash: '' })); }
+      if (sheetEls) {
+        const pushed = !!(history.state && history.state.sheet);
+        hideSheet();
+        if (pushed) {
+          history.replaceState({ ...history.state, sheet: false }, '', urlFor(next));
+          sync();
+          return;
+        }
+        history.replaceState({ ...(history.state || {}), sheet: false }, '', urlFor({ ...params(), l: null, hash: '' }));
+      }
       go(next);
     }
   }
@@ -854,20 +878,13 @@ document.addEventListener('change', (e) => {
   if (!f) return;
   const k = f.dataset.filter;
   const v = f.value;
-  if (k === 's' && v === 'near' && !state.geo) locate();
+  if (k === 's' && v === 'near' && geoStale()) locate();
   go({ [k]: k === 'c' ? (Number(v) || null) : v }, { keep: true, push: false });
 });
 
 // ─────────────── البحث ───────────────
 
 const input = $('#q');
-const pushQuery = debounce(() => {
-  const p = params();
-  if (p.q !== input.value.trim()) {
-    const url = urlFor({ ...p, q: input.value.trim(), l: null, hash: '' });
-    history.replaceState(history.state, '', url);
-  }
-}, 350);
 
 input.addEventListener('input', () => {
   const q = input.value;
@@ -877,11 +894,10 @@ input.addEventListener('input', () => {
   if (wasHome && q.trim()) {
     history.pushState({ idx: ((history.state && history.state.idx) || 0) + 1 }, '', urlFor({ ...p, q: q.trim() }));
   } else {
-    history.replaceState(history.state, '', urlFor({ ...p, q: q.trim(), v: p.v === 'cats' ? '' : p.v }));
+    history.replaceState(history.state, '', urlFor({ ...p, q: q.trim(), v: p.v === 'cats' || p.v === 'favs' ? '' : p.v }));
   }
   state.viewKey = '';
   sync();
-  pushQuery();
 });
 
 $('#search-form').addEventListener('submit', (e) => {

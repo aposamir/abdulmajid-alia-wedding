@@ -199,6 +199,7 @@ detect_caddy() {
 }
 
 caddy_validate() { caddy validate --config "$CADDYFILE" --adapter caddyfile >"$STATE/validate.log" 2>&1; }
+caddy_adapt()    { caddy adapt --config "$CADDYFILE" --adapter caddyfile >"$1" 2>"$STATE/adapt.log"; }
 caddy_reload()   { systemctl reload caddy >"$STATE/reload.log" 2>&1; }
 
 # يحلل ملفات Caddy ويستبدل كتلة النطاق (أو يعيدها)؛ لا يكتب شيئاً في وضع analyze
@@ -210,9 +211,16 @@ mode, caddyfile, host, site_conf, state, MARK = sys.argv[1:7]
 host = host.lower()
 IMPORT_LINE = 'import ' + site_conf
 
+TARGETS = {host, 'www.' + host}
+
 def fail(msg):
     print(json.dumps({'status': 'error', 'error': msg}, ensure_ascii=False))
     sys.exit(0)
+
+def read_text(f):
+    """النص دون علامة BOM (يتجاهلها Caddy)، مع تذكّر وجودها لإعادتها عند الكتابة"""
+    t = open(f, encoding='utf-8', newline='').read()
+    return (t[1:], True) if t.startswith('﻿') else (t, False)
 
 def scan(text):
     """أحداث الأقواس خارج النصوص والتعليقات وheredoc: [(رقم السطر، القوس)]"""
@@ -225,15 +233,18 @@ def scan(text):
             start = True; i += 1; continue
         if c == '#' and start:
             j = text.find('\n', i); i = n if j < 0 else j; continue
-        if c == '"':
+        # مثل Caddy: علامة الاقتباس تبدأ نصاً في أول الكلمة فقط
+        if c == '"' and start:
             i += 1
             while i < n and text[i] != '"':
-                if text[i] == '\\': i += 1
+                if text[i] == '\\':
+                    i += 1
+                    if i < n and text[i] == '\n': line += 1
                 elif text[i] == '\n': line += 1
                 i += 1
             if i >= n: raise ValueError('quoted string without end')
             i += 1; start = False; continue
-        if c == '`':
+        if c == '`' and start:
             j = text.find('`', i + 1)
             if j < 0: raise ValueError('backtick string without end')
             line += text.count('\n', i, j); i = j + 1; start = False; continue
@@ -267,8 +278,16 @@ def code_part(s):
         out.append(ch)
     return ''.join(out).rstrip()
 
+def prev_code(codes, i):
+    """أقرب سطر فيه كود قبل السطر i (تُتخطّى الأسطر الفارغة والتعليقات)"""
+    j = i - 1
+    while j >= 0 and codes[j] == '':
+        j -= 1
+    return j if j >= 0 else None
+
 def blocks(text):
     lines = text.split('\n')
+    codes = [code_part(l).strip() for l in lines]
     res, depth, cur = [], 0, None
     for ln, ch in scan(text):
         if ch == '{':
@@ -278,9 +297,19 @@ def blocks(text):
             depth -= 1
             if depth < 0: raise ValueError('extra } at line %d' % (ln + 1))
             if depth == 0:
-                head = code_part(lines[cur])
-                if head.endswith('{'):
-                    res.append({'start': cur, 'end': ln, 'head': head[:-1].strip()})
+                if not codes[cur].endswith('{'): continue
+                start, head = cur, codes[cur][:-1].strip()
+                if head == '':
+                    # «{» وحده في سطر: العنوان في السطر السابق (إلا كتلة الإعدادات العامة)
+                    k = prev_code(codes, cur)
+                    if k is not None and not codes[k].endswith(('{', '}')):
+                        start, head = k, codes[k]
+                # قائمة عناوين ممتدة على عدة أسطر تنتهي بفاصلة
+                k = prev_code(codes, start)
+                while head and k is not None and codes[k].endswith(','):
+                    start, head = k, codes[k] + ' ' + head
+                    k = prev_code(codes, start)
+                res.append({'start': start, 'end': ln, 'head': head})
     if depth != 0: raise ValueError('unbalanced braces')
     return res, lines
 
@@ -291,9 +320,9 @@ def top_imports(text, lines, base_dir):
     out = []
     for k, l in enumerate(lines):
         if k in inside: continue
-        m = re.match(r'\s*import\s+(\S+)', code_part(l))
+        m = re.match(r'\s*import\s+(?:"([^"]+)"|`([^`]+)`|(\S+))', code_part(l))
         if m:
-            p = m.group(1)
+            p = m.group(1) or m.group(2) or m.group(3)
             if '/' in p or '*' in p or '.' in p:
                 out.append(os.path.join(base_dir, p) if not os.path.isabs(p) else p)
     return out
@@ -314,7 +343,7 @@ def files_to_scan():
         f = os.path.realpath(f)
         if f in seen or d > 3 or not os.path.isfile(f): continue
         seen.add(f); order.append(f)
-        text = open(f, encoding='utf-8', newline='').read()
+        text = read_text(f)[0]
         b, lines = blocks(text)
         for pat in top_imports(text, lines, os.path.dirname(f)):
             for g in sorted(glob.glob(pat)):
@@ -324,7 +353,7 @@ def files_to_scan():
 def analyze():
     found, already = [], []
     for f in files_to_scan():
-        text = open(f, encoding='utf-8', newline='').read()
+        text = read_text(f)[0]
         try:
             bl, lines = blocks(text)
         except ValueError as e:
@@ -334,7 +363,10 @@ def analyze():
         for b in bl:
             if not b['head'] or b['head'].startswith('('): continue
             if '{' in b['head'] or '}' in b['head']:
-                fail('سطر عنوان غير مألوف في %s سطر %d' % (f, b['start'] + 1))
+                # عنوان فيه متغيّر مثل {$N8N_HOST}: لا يخصّنا إلا إن ذُكر نطاقنا فيه
+                if host in b['head'].lower():
+                    fail('سطر عنوان غير مألوف في %s سطر %d' % (f, b['start'] + 1))
+                continue
             addrs = [a for a in re.split(r'[,\s]+', b['head']) if a]
             parsed = [norm(a) for a in addrs]
             if not any(h == host and s != 'http' for s, h in parsed): continue
@@ -353,11 +385,11 @@ def analyze():
         fail('وجدت أكثر من كتلة لـ %s: %s' % (host, ', '.join('%s:%d' % (x['file'], x['start'] + 1) for x in found)))
     return dict(found[0], status='patch')
 
-def write_like(path, text):
+def write_like(path, text, bom=False):
     st = os.stat(path)
     tmp = path + '.dalil-hama-site.tmp'
     with open(tmp, 'w', encoding='utf-8', newline='') as fh:
-        fh.write(text)
+        fh.write(('﻿' if bom else '') + text)
     os.chmod(tmp, st.st_mode & 0o7777)
     try: os.chown(tmp, st.st_uid, st.st_gid)
     except PermissionError: pass
@@ -370,7 +402,7 @@ def main():
         r = analyze()
         if r['status'] != 'patch':
             print(json.dumps(r, ensure_ascii=False)); return
-        text = open(r['file'], encoding='utf-8', newline='').read()
+        text, bom = read_text(r['file'])
         lines = text.split('\n')
         old = '\n'.join(lines[r['start']:r['end'] + 1]) + '\n'
         indent = re.match(r'[ \t]*', lines[r['start']]).group(0)
@@ -380,7 +412,7 @@ def main():
             fh.write(old)
         with open(os.path.join(state, 'patched-file'), 'w', encoding='utf-8', newline='') as fh:
             fh.write(r['file'] + '\n')
-        write_like(r['file'], '\n'.join(new))
+        write_like(r['file'], '\n'.join(new), bom)
         print(json.dumps(dict(r, status='patched'), ensure_ascii=False))
     elif mode == 'unpatch':
         try:
@@ -388,7 +420,7 @@ def main():
             old = open(os.path.join(state, 'old-block.caddy'), encoding='utf-8', newline='').read()
         except OSError:
             fail('لا توجد نسخة محفوظة من كتلة الموقع القديم')
-        text = open(f, encoding='utf-8', newline='').read()
+        text, bom = read_text(f)
         lines = text.split('\n')
         idx = [k for k, l in enumerate(lines) if code_part(l).strip() == IMPORT_LINE]
         if len(idx) != 1:
@@ -396,8 +428,33 @@ def main():
         k = idx[0]
         a = k - 1 if k > 0 and lines[k - 1].strip() == MARK else k
         new = lines[:a] + old.rstrip('\n').split('\n') + lines[k + 1:]
-        write_like(f, '\n'.join(new))
+        write_like(f, '\n'.join(new), bom)
         print(json.dumps({'status': 'unpatched', 'file': f}, ensure_ascii=False))
+    elif mode == 'compare':
+        # حارس أخير: الإعداد كما يفهمه Caddy نفسه قبل التعديل وبعده (caddy adapt)
+        # يجب أن يبقى متطابقاً لكل المواقع عدا نطاقنا
+        before = routes_of(json.load(open(caddyfile, encoding='utf-8')))
+        after = routes_of(json.load(open(site_conf, encoding='utf-8')))
+        if before != after:
+            hosts = sorted({h for r in set(before) ^ set(after) for h in json.loads(r)[1]}) or ['(بلا نطاق)']
+            fail('التعديل كان سيغيّر مواقع أخرى في Caddy: %s' % ', '.join(hosts))
+        print(json.dumps({'status': 'same'}))
+
+def routes_of(cfg):
+    """مسارات كل الخوادم عدا التي تخص نطاقنا وحده، بصيغة قابلة للمقارنة"""
+    out = []
+    servers = (((cfg or {}).get('apps') or {}).get('http') or {}).get('servers') or {}
+    for srv in servers.values():
+        listen = sorted(srv.get('listen') or [])
+        groups = (('routes', srv.get('routes') or []), ('errors', (srv.get('errors') or {}).get('routes') or []))
+        for kind, rs in groups:
+            for r in rs:
+                hosts = set()
+                for m in r.get('match') or []:
+                    hosts.update(h.lower() for h in (m.get('host') or []))
+                if hosts and hosts <= TARGETS: continue
+                out.append(json.dumps([listen, sorted(hosts), kind, r], sort_keys=True, ensure_ascii=False))
+    return sorted(out)
 
 try:
     main()
@@ -544,25 +601,42 @@ cmd_install() {
     [ -n "$addresses" ] || addresses=$HOST
   fi
 
-  restore() {
+  restore_files() {
     cp -p -- "$backup" "$file"
     if [ -f "$STATE/site.caddy.$ts.bak" ]; then cp -p -- "$STATE/site.caddy.$ts.bak" "$SITE_CONF"; fi
+  }
+  restore() {
+    restore_files
     caddy_reload || warn "تعذّرت إعادة تحميل Caddy بعد الاسترجاع؛ راجع: systemctl status caddy"
   }
 
+  if [ "$status" = patch ]; then
+    caddy_adapt "$STATE/adapt-before.json" ||
+      { cat "$STATE/adapt.log" >&2; die "تعذّرت قراءة إعداد Caddy الحالي؛ لم يتغير شيء"; }
+  fi
   write_site_conf "$addresses"
   if [ "$status" = patch ]; then
     analysis=$(caddy_patch apply "$CADDYFILE" "$HOST" "$SITE_CONF" "$STATE")
     if [ "$(json_get "$analysis" status)" != patched ]; then
-      cp -p -- "$backup" "$file"
+      restore_files
       die "$(json_get "$analysis" error)؛ لم يتغير شيء في Caddy"
+    fi
+    # حارس: كل المواقع الأخرى (n8n وغيره) يجب أن تبقى كما هي حرفياً في نظر Caddy
+    if ! caddy_adapt "$STATE/adapt-after.json"; then
+      restore_files
+      cat "$STATE/adapt.log" >&2
+      die "رفض Caddy الإعداد الجديد فأعدت الملف كما كان؛ الموقع القديم يعمل كما هو"
+    fi
+    analysis=$(caddy_patch compare "$STATE/adapt-before.json" "$HOST" "$STATE/adapt-after.json" "$STATE")
+    if [ "$(json_get "$analysis" status)" != same ]; then
+      restore_files
+      die "$(json_get "$analysis" error)، فأعدت الملف كما كان ولم يتغير شيء"
     fi
   fi
 
   say "٣/٤ فحص الإعداد وتفعيله…"
   if ! caddy_validate; then
-    cp -p -- "$backup" "$file"
-    [ -f "$STATE/site.caddy.$ts.bak" ] && cp -p -- "$STATE/site.caddy.$ts.bak" "$SITE_CONF"
+    restore_files
     cat "$STATE/validate.log" >&2
     die "رفض Caddy الإعداد الجديد فأعدت الملف كما كان؛ الموقع القديم يعمل كما هو"
   fi
@@ -643,8 +717,21 @@ cmd_rollback() {
   ts=$(date +%Y%m%d-%H%M%S)
   backup="$STATE/$(basename "$file").$ts.before-rollback.bak"
   cp -p -- "$file" "$backup"
+  local guard=0
+  caddy_adapt "$STATE/adapt-before.json" && guard=1
   r=$(caddy_patch unpatch "$CADDYFILE" "$HOST" "$SITE_CONF" "$STATE")
   [ "$(json_get "$r" status)" = unpatched ] || die "$(json_get "$r" error)"
+  if [ "$guard" = 1 ]; then
+    if caddy_adapt "$STATE/adapt-after.json"; then
+      r=$(caddy_patch compare "$STATE/adapt-before.json" "$HOST" "$STATE/adapt-after.json" "$STATE")
+    else
+      r='{"status":"error","error":"رفض Caddy إعداد الموقع القديم"}'
+    fi
+    if [ "$(json_get "$r" status)" != same ]; then
+      cp -p -- "$backup" "$file"
+      die "$(json_get "$r" error)؛ أبقيت الموقع الجديد كما هو"
+    fi
+  fi
   if ! caddy_validate || ! caddy_reload; then
     cp -p -- "$backup" "$file"
     caddy_reload || true

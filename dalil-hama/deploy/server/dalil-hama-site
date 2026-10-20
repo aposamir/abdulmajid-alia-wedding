@@ -14,6 +14,7 @@
 # قاعدة البيانات على السيرفر نفسه (PostgreSQL المحلي، مع PostgREST للبيانات وGoTrue لدخول المشرفين):
 #   sudo dalil-hama-site install-db                 أول مرة: يطلب مفتاح النقل، ثم ينقل البيانات من Supabase ويحوّل الموقع إليها
 #   sudo dalil-hama-site install-db                 بعد النقل: تحديث الخدمات والمخطط (لا يمس البيانات)
+#   sudo dalil-hama-site install-db --replace       نقل جديد من Supabase يحل محل قاعدة السيرفر (بعد db-rollback، مع نسخة احتياطية قبله)
 #   sudo dalil-hama-site backup                     نسخة احتياطية الآن (تجري تلقائياً كل ليلة)
 #   sudo dalil-hama-site db-rollback                إعادة الموقع إلى Supabase
 #
@@ -48,6 +49,8 @@ AUTH_PORT=${DH_AUTH_PORT:-8032}
 BACKUP_DIR=${DH_BACKUP_DIR:-/var/backups/dalil-hama-site}
 BACKEND_FLAG=$ETC/backend-local
 OVERRIDE=$BASE/override
+# القاعدة المنقولة تُبنى أولاً باسم ${DB}_new ثم تأخذ اسم $DB
+HBA_LINE="host $DB,${DB}_new authenticator,supabase_auth_admin 127.0.0.1/32 scram-sha-256"
 PGRST_VERSION=v13.0.7
 AUTH_VERSION=v2.197.0
 # بصمات الملفات الرسمية (x86_64 ثم aarch64)
@@ -61,8 +64,14 @@ read -r -a VERIFY_OPTS <<< "${DH_VERIFY_CURL_OPTS:-}"
 MARKER='# dalil-hama-site: الموقع الجديد لدليل حماة. للرجوع إلى القديم: sudo dalil-hama-site rollback'
 QUIET=0
 TMP=
+EXPORT_LEFT=0
 
-cleanup() { [ -n "$TMP" ] && rm -rf -- "$TMP"; return 0; }
+cleanup() {
+  [ -n "$TMP" ] && rm -rf -- "$TMP"
+  # نسخة البيانات المنقولة فيها بصمات كلمات مرور المشرفين: لا تبقى على القرص بعد انتهاء الأمر
+  [ "$EXPORT_LEFT" = 1 ] && shred_export
+  return 0
+}
 trap cleanup EXIT
 
 say()  { [ "$QUIET" = 1 ] || printf '%s\n' "$*" || true; }
@@ -223,7 +232,16 @@ fetch_release() {
   find "$TMP/site" -type d -exec chmod 755 {} +
   find "$TMP/site" -type f -exec chmod 644 {} +
   mv -T "$TMP/site" "$dir"
+  # ملفات مخطط قاعدة البيانات التي يتطلبها هذا الإصدار (للتحقق قبل تفعيله على قاعدة السيرفر)
+  { tar -tzf "$TMP/src.tgz" --wildcards "*/dalil-hama/supabase/migrations/*.sql" 2>/dev/null || true; } |
+    sed 's#.*/##' | LC_ALL=C sort > "$BASE/releases/$sha.migrations"
   rm -rf -- "$TMP"; TMP=
+}
+
+# ملفات مخطط يتطلبها الإصدار ولم تُطبَّق على قاعدة السيرفر بعد (فارغ إن لم ينقص شيء)
+missing_migrations() {
+  [ -f "$BACKEND_FLAG" ] && [ -s "$BASE/releases/$1.migrations" ] || return 0
+  LC_ALL=C comm -23 "$BASE/releases/$1.migrations" <(LC_ALL=C sort "$ETC/applied-migrations" 2>/dev/null) | tr '\n' ' '
 }
 
 # سجل الإصدارات المعروضة (الأحدث آخراً)، يرجع خلاله أمر previous خطوة خطوة
@@ -265,6 +283,7 @@ prune() {
     is_sha "$s" || continue
     case $keep in *" $s "*) continue ;; esac
     rm -rf -- "${BASE:?}/releases/$s"
+    rm -f -- "${BASE:?}/releases/$s.migrations"
   done
   return 0
 }
@@ -590,8 +609,13 @@ json_get() { python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get(sys.
 # مسارات قاعدة البيانات على السيرفر (بعد النقل فقط): البيانات والدخول على النطاق نفسه،
 # وconfig.js بديل يوجّه الواجهة إليها بدل Supabase
 # (ترويسة CF-Connecting-IP يضعها الزائر نفسه هنا، لا Cloudflare، فتُحذف كي لا يتجاوز حدود الطلبات بها)
+# ROUTES=local|supabase يحدد الوجهة صراحةً (caddy_switch)؛ دونه تُتبع علامة backend-local
 api_routes() {
-  [ -f "$BACKEND_FLAG" ] || return 0
+  case ${ROUTES:-} in
+    local) ;;
+    supabase) return 0 ;;
+    *) [ -f "$BACKEND_FLAG" ] || return 0 ;;
+  esac
   cat <<EOF
 
 	handle_path /rest/v1/* {
@@ -750,6 +774,8 @@ install_backend_binaries() {
     *) die "معالج السيرفر ($(uname -m)) غير مدعوم" ;;
   esac
   mkdir -p "$OPT"; chmod 755 "$OPT"
+  # بقايا تنزيل انقطع؛ القفل بأيدينا فلا تنزيل آخر جارٍ
+  rm -rf -- "$OPT"/.tmp.*
   if [ ! -x "$OPT/postgrest-$PGRST_VERSION/postgrest" ]; then
     TMP=$(mktemp -d "$OPT/.tmp.XXXXXX")
     fetch_verified "$pg_url" "$pg_sha" "$TMP/p.tar.xz"
@@ -793,6 +819,9 @@ pg_checks() {
   v=$(pg -Atc "show server_version_num") || die "تعذّر الاتصال بـ PostgreSQL المحلي"
   [ "$v" -ge 130000 ] || die "PostgreSQL على السيرفر قديم ($v)؛ المطلوب 13 أو أحدث"
   PG_PORT=$(pg -Atc "show port")
+  local enc
+  enc=$(pg -Atc "select pg_encoding_to_char(encoding) from pg_database where datname = '$DB'")
+  [ -z "$enc" ] || [ "$enc" = UTF8 ] || die "قاعدة $DB على السيرفر بترميز $enc لا UTF8؛ لن أكتب فيها نصوصاً عربية"
 }
 
 db_exists()   { [ "$(pg -Atc "select 1 from pg_database where datname = '$DB'")" = 1 ]; }
@@ -804,7 +833,8 @@ db_has_data() {
 
 # الأدوار كما في Supabase، وقاعدة يملكها dalil_owner (ليس المستخدم الجذري لـ PostgreSQL)
 db_bootstrap() {
-  pg -v pw_api="$PW_API" -v pw_auth="$PW_AUTH" -f - >/dev/null <<'SQL'
+  pg -v db="$DB" -v pw_api="$PW_API" -v pw_auth="$PW_AUTH" -f - >/dev/null <<'SQL'
+set client_min_messages = warning;
 do $$ begin
   if not exists (select from pg_roles where rolname = 'anon') then create role anon nologin noinherit; end if;
   if not exists (select from pg_roles where rolname = 'authenticated') then create role authenticated nologin noinherit; end if;
@@ -816,11 +846,16 @@ end $$;
 alter role authenticator password :'pw_api';
 alter role supabase_auth_admin password :'pw_auth';
 alter role authenticator set statement_timeout = '8s';
+alter role anon set statement_timeout = '3s';
+alter role authenticated set statement_timeout = '8s';
 grant anon, authenticated, service_role to authenticator;
-select 'create database dalil_hama owner dalil_owner' where not exists (select from pg_database where datname = 'dalil_hama') \gexec
-\connect dalil_hama
-revoke all on database dalil_hama from public;
-grant connect, temporary on database dalil_hama to authenticator, supabase_auth_admin;
+-- UTF8 صراحةً: عناقيد PostgreSQL المهيّأة بلغة C تكون SQL_ASCII، فتُعدّ الحروف العربية بالبايت
+select format('create database %I owner dalil_owner encoding ''UTF8'' lc_collate ''C.UTF-8'' lc_ctype ''C.UTF-8'' template template0', :'db')
+ where not exists (select from pg_database where datname = :'db') \gexec
+\connect :db
+set client_min_messages = warning;
+revoke all on database :"db" from public;
+grant connect, temporary on database :"db" to authenticator, supabase_auth_admin;
 create schema if not exists auth authorization supabase_auth_admin;
 create schema if not exists extensions;
 create extension if not exists pgcrypto with schema extensions;
@@ -831,11 +866,16 @@ grant usage on schema public to anon, authenticated, service_role;
 create table if not exists dh_meta.migrations (name text primary key, applied_at timestamptz not null default now());
 alter table dh_meta.migrations owner to dalil_owner;
 SQL
-  local who pw
+  local who pw hba
   for who in authenticator supabase_auth_admin; do
     if [ "$who" = authenticator ]; then pw=$PW_API; else pw=$PW_AUTH; fi
-    PGPASSWORD=$pw psql -X -q -h 127.0.0.1 -p "$PG_PORT" -U "$who" -d "$DB" -Atc 'select 1' >/dev/null 2>&1 ||
-      die "PostgreSQL يرفض دخول $who بكلمة مرور من 127.0.0.1؛ أضف إلى pg_hba.conf السطر: host $DB authenticator,supabase_auth_admin 127.0.0.1/32 scram-sha-256"
+    if ! PGPASSWORD=$pw psql -X -q -h 127.0.0.1 -p "$PG_PORT" -U "$who" -d "$DB" -Atc 'select 1' >/dev/null 2>&1; then
+      hba=$(pg -Atc 'show hba_file' 2>/dev/null) || hba=pg_hba.conf
+      # أول سطر يطابق في pg_hba هو المعتمد، فلا يكفي إلحاق السطر في آخر الملف
+      die "PostgreSQL يرفض دخول $who بكلمة مرور من 127.0.0.1. أضف هذا السطر في $hba فوق أسطر host الأخرى:
+  $HBA_LINE
+ثم: sudo systemctl reload postgresql وأعد الأمر"
+    fi
   done
 }
 
@@ -887,8 +927,8 @@ SQL
 
 # مخطط الدليل من مجلد supabase/migrations في الإصدار المعروض نفسه؛ كل ملف يُطبَّق مرة واحدة
 app_migrations() {
-  local sha f name
-  sha=$(current_sha) || die "لا يوجد إصدار مثبّت من الموقع"
+  local sha=$1 f name
+  rm -rf -- "$STATE"/.tmp.*
   TMP=$(mktemp -d "$STATE/.tmp.XXXXXX")
   if [ -n "${DH_SOURCE_TARBALL:-}" ]; then cp -- "$DH_SOURCE_TARBALL" "$TMP/src.tgz"
   else curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 300 -o "$TMP/src.tgz" \
@@ -917,7 +957,7 @@ db-schemas = "public"
 db-anon-role = "anon"
 db-extra-search-path = "public, extensions"
 db-max-rows = 1000
-db-pool = 10
+db-pool = 4
 jwt-secret = "$JWT_SECRET"
 jwt-aud = "authenticated"
 openapi-mode = "disabled"
@@ -993,6 +1033,7 @@ WorkingDirectory=$OPT/auth-$AUTH_VERSION"
 fetch_export() {
   local out=$STATE/export.json
   rm -f -- "$out"
+  EXPORT_LEFT=1
   if [ -n "${DH_EXPORT_FILE:-}" ]; then cp -- "$DH_EXPORT_FILE" "$out"
   else
     printf '{"p_token":"%s"}' "$1" | curl -fsS --compressed --connect-timeout 20 --max-time 180 -X POST \
@@ -1063,7 +1104,49 @@ begin
 end $$;
 commit;
 SQL
-  } | pg -d "$DB" -f - >"$STATE/import.log" 2>&1 || { tail -n 5 "$STATE/import.log" >&2; die "فشل استيراد البيانات إلى قاعدة السيرفر"; }
+  } | pg -d "$DB" -f - >"$STATE/import.log" 2>&1 || { tail -n 5 "$STATE/import.log" >&2; die "فشل استيراد البيانات إلى قاعدة السيرفر؛ لم يتغير شيء"; }
+}
+
+shred_export() {
+  shred -u -- "$STATE/export.json" "$STATE/export.line" 2>/dev/null || true
+  rm -f -- "$STATE/export.json" "$STATE/export.line"
+}
+
+drop_db() { pg -c "set client_min_messages = warning" -c "drop database if exists \"$1\" with (force)" >/dev/null; }
+
+# القاعدة المنقولة تُبنى كاملة باسم مؤقت؛ القاعدة الحالية (إن وُجدت) لا تُمس حتى ينجح الاستيراد
+build_new_db() {   # sha
+  local DB=${DB}_new
+  drop_db "$DB"
+  db_bootstrap
+  gotrue_migrate
+  db_owner_grants
+  app_migrations "$1"
+  import_export
+}
+
+# تبديل الاسمين في معاملة واحدة: إما القاعدة الجديدة كاملة وإما القديمة كما هي
+swap_in_new_db() {
+  local new=${DB}_new old=${DB}_old
+  systemctl stop dalil-hama-api dalil-hama-auth >/dev/null 2>&1 || true
+  drop_db "$old"
+  if db_exists; then
+    pg -c "select pg_terminate_backend(pid) from pg_stat_activity where datname in ('$DB', '$new') and pid <> pg_backend_pid()" >/dev/null
+    pg -1 -c "alter database $DB rename to $old" -c "alter database $new rename to $DB" >/dev/null ||
+      die "تعذّر وضع البيانات المنقولة مكان قاعدة السيرفر؛ لم يتغير شيء"
+    drop_db "$old"
+  else
+    pg -c "alter database $new rename to $DB" >/dev/null || die "تعذّر وضع البيانات المنقولة في قاعدة $DB"
+  fi
+}
+
+# أحدث نسخة احتياطية وطريقة استرجاعها (لرسائل الأعطال)
+restore_hint() {
+  local last
+  last=$(ls -1t -- "$BACKUP_DIR/$DB-"*.dump 2>/dev/null | head -n 1) || last=
+  if [ -z "$last" ]; then printf 'لا توجد نسخة احتياطية في %s' "$BACKUP_DIR"; return 0; fi
+  printf 'لاسترجاع آخر نسخة احتياطية (%s):\n  sudo systemctl stop dalil-hama-api dalil-hama-auth\n  sudo cat %s | sudo -u postgres pg_restore --clean --if-exists --create -d postgres\n  sudo dalil-hama-site install-db' \
+    "${last##*/}" "$last"
 }
 
 # config.js الإصدار الحالي، موجَّهاً إلى قاعدة السيرفر (يُعاد مع كل إصدار جديد)
@@ -1072,21 +1155,28 @@ write_override() {
   local src=$BASE/current/assets/js/config.js dir=$OVERRIDE/assets/js
   [ -f "$src" ] || return 0
   mkdir -p "$dir"
-  sed -E -e "s#^export const SUPABASE_URL = .*#export const SUPABASE_URL = '';#" \
-         -e "s#^export const SUPABASE_KEY = .*#export const SUPABASE_KEY = 'local';#" "$src" > "$dir/config.js.new"
-  grep -q "^export const SUPABASE_URL = '';" "$dir/config.js.new" || printf "export const SUPABASE_URL = '';\n" >> "$dir/config.js.new"
+  sed -E -e "s#^[[:space:]]*export[[:space:]]+const[[:space:]]+SUPABASE_URL[[:space:]]*=.*#export const SUPABASE_URL = '';#" \
+         -e "s#^[[:space:]]*export[[:space:]]+const[[:space:]]+SUPABASE_KEY[[:space:]]*=.*#export const SUPABASE_KEY = 'local';#" \
+         "$src" > "$dir/config.js.new"
+  # سطر واحد بالضبط يوجّه إلى السيرفر؛ وإلا يبقى الملف السابق كما هو (لا تكرار للتصدير يكسر الموقع)
+  if [ "$(grep -c "SUPABASE_URL" "$dir/config.js.new")" != 1 ] ||
+     ! grep -q "^export const SUPABASE_URL = '';$" "$dir/config.js.new"; then
+    rm -f -- "$dir/config.js.new"
+    warn "صيغة config.js في هذا الإصدار غير متوقعة؛ أبقيت ملف الإعداد السابق"
+    return 0
+  fi
   chmod 644 "$dir/config.js.new"; chmod 755 "$OVERRIDE" "$OVERRIDE/assets" "$dir"
   mv -f -- "$dir/config.js.new" "$dir/config.js"
 }
 
-backend_serving() {   # expected number of published listings (or empty to skip)
+backend_serving() {   # expected number of published listings (or empty: any non-zero)
   local until=$((SECONDS + 30)) n
   while [ "$SECONDS" -lt "$until" ]; do
     if local_https /assets/js/config.js -H 'Cache-Control: no-cache' 2>/dev/null | grep -q "^export const SUPABASE_URL = '';" &&
        local_https /auth/v1/health 2>/dev/null | grep -q GoTrue; then
       n=$(local_https /rest/v1/rpc/sync -X POST -H 'content-type: application/json' -d '{}' 2>/dev/null |
           python3 -c 'import json,sys; print(len(json.load(sys.stdin)["items"]))' 2>/dev/null) || n=
-      if [ -n "$n" ] && { [ -z "${1:-}" ] || [ "$n" = "$1" ]; }; then return 0; fi
+      if [ -n "$n" ] && { { [ -z "${1:-}" ] && [ "$n" -gt 0 ]; } || [ "$n" = "${1:-}" ]; }; then return 0; fi
     fi
     sleep 1
   done
@@ -1120,8 +1210,8 @@ EOF
   systemctl enable --now dalil-hama-site-backup.timer >/dev/null 2>&1 || warn "تعذّر تفعيل النسخ الاحتياطي الليلي"
 }
 
-caddy_switch() {   # يعيد كتابة إعداد الموقع ويفعّله؛ يعيد 1 دون تغيير إن رفضه Caddy
-  local addresses backup=$STATE/site.caddy.switch.bak
+caddy_switch() {   # local|supabase: يعيد كتابة إعداد الموقع ويفعّله؛ يعيد 1 دون تغيير إن رفضه Caddy
+  local ROUTES=$1 addresses backup=$STATE/site.caddy.switch.bak
   addresses=$(current_addresses)
   cp -p -- "$SITE_CONF" "$backup"
   write_site_conf "$addresses"
@@ -1140,7 +1230,7 @@ cmd_install() {
   detect_caddy
   mkdir -p "$STATE"; chmod 700 "$STATE"
 
-  local self sha ts analysis status file addresses backup
+  local self sha ts analysis status file addresses backup missing cur
   self=$(readlink -f "${BASH_SOURCE[0]}")
   [ -f "$self" ] || die "نزّل الملف أولاً ثم شغّله: sudo bash /tmp/dalil-hama-site install"
 
@@ -1150,6 +1240,12 @@ cmd_install() {
   ensure_history
   sha=$(remote_sha) || die "تعذّر معرفة آخر إصدار من GitHub ($REPO / $BRANCH)"
   fetch_release "$sha"
+  missing=$(missing_migrations "$sha")
+  if [ -n "${missing// /}" ] && cur=$(current_sha) && [ -d "$BASE/releases/$cur" ]; then
+    # كما في التحديث التلقائي: واجهة تحتاج مخططاً لم يُطبَّق على قاعدة السيرفر تنتظر install-db
+    warn "الإصدار ${sha:0:7} يحتاج تحديث قاعدة البيانات (${missing% })، فأبقيت الموقع على ${cur:0:7}. بعد التثبيت شغّل: sudo dalil-hama-site install-db"
+    sha=$cur
+  fi
   activate "$sha"
   printf '%s\n' "$sha" > "$BASE/last-checked"
   rm -f -- "$BASE/PINNED" "$BASE/.last-error"
@@ -1288,10 +1384,17 @@ cmd_update() {
     return 0
   fi
   fetch_release "$sha"
+  local missing
+  missing=$(missing_migrations "$sha")
+  if [ -n "${missing// /}" ]; then
+    # الواجهة الجديدة تحتاج مخططاً لم يُطبَّق بعد؛ تفعيلها الآن يكسر الموقع، فتنتظر install-db
+    die "الإصدار ${sha:0:7} يحتاج تحديث قاعدة البيانات (${missing% }) فبقي الموقع على ${cur:0:7}. شغّل: sudo dalil-hama-site install-db"
+  fi
   if [ -n "$cur" ] && [ -d "$BASE/releases/$cur" ] &&
      [ "$(release_digest "$BASE/releases/$sha")" = "$(release_digest "$BASE/releases/$cur")" ]; then
     # الإصدار لم يغيّر ملفات الموقع (تعديل في جزء آخر من المستودع): يبقى المعروض كما هو
     rm -rf -- "${BASE:?}/releases/$sha"
+    rm -f -- "${BASE:?}/releases/$sha.migrations"
     printf '%s\n' "$sha" > "$BASE/last-checked"
     rm -f -- "$ERRLOG"
     fix_owner
@@ -1377,31 +1480,38 @@ cmd_rollback() {
 
 cmd_install_db() {
   need_root install-db
-  local token='' replace=0 a live=0 self
+  local token='' replace=0 a self mode rel had_marker=0
   for a in "$@"; do case $a in --replace) replace=1 ;; *) token=$a ;; esac; done
-  need_tools curl tar xz python3 flock psql pg_dump runuser sha256sum
+  need_tools curl tar xz python3 flock psql pg_dump runuser sha256sum shred
   load_conf
   detect_caddy
   [ -f "$STATE/patched-file" ] && [ -L "$BASE/current" ] || die "ثبّت الموقع أولاً: sudo dalil-hama-site install"
   systemctl is-active --quiet postgresql || die "PostgreSQL لا يعمل على هذا السيرفر"
-  [ -f "$BACKEND_FLAG" ] && live=1
-  # reattach: الموقع عمل على قاعدة السيرفر ثم أُعيد إلى Supabase؛ نعود إليها كما هي دون نقل جديد
-  local reattach=0
-  if [ "$live" = 0 ] && [ -z "$token" ] && [ -z "${DH_EXPORT_FILE:-}" ]; then
-    if [ -f "$ETC/backend-was-live" ]; then
-      reattach=1
-    elif [ -t 0 ]; then
-      # يُطلب المفتاح هنا كي لا يظهر في قائمة العمليات وسجل sudo
-      read -r -s -p "الصق مفتاح النقل ثم اضغط Enter: " token; echo
-    else
-      die "شغّل الأمر في الطرفية ليطلب مفتاح النقل: sudo dalil-hama-site install-db"
-    fi
+  # live: الموقع يعمل على قاعدة السيرفر، فتحديث للخدمات والمخطط فقط
+  # reattach: عمل عليها ثم أُعيد إلى Supabase، فنعود إليها كما هي دون نقل جديد
+  # transfer: نقل جديد من Supabase بمفتاح النقل
+  if [ -f "$BACKEND_FLAG" ]; then mode=live
+  elif [ -n "$token" ] || [ -n "${DH_EXPORT_FILE:-}" ] || [ "$replace" = 1 ] || [ ! -f "$ETC/backend-was-live" ]; then mode=transfer
+  else mode=reattach; fi
+  if [ "$mode" = live ] && { [ -n "$token" ] || [ "$replace" = 1 ]; }; then
+    die "الموقع يعمل على قاعدة السيرفر الآن؛ لن أستبدلها. للنقل من جديد من Supabase: sudo dalil-hama-site db-rollback ثم sudo dalil-hama-site install-db --replace"
+  fi
+  if [ "$mode" = transfer ] && [ -z "$token" ] && [ -z "${DH_EXPORT_FILE:-}" ]; then
+    # يُطلب المفتاح هنا كي لا يظهر في قائمة العمليات وسجل sudo
+    [ -t 0 ] || die "شغّل الأمر في الطرفية ليطلب مفتاح النقل: sudo dalil-hama-site install-db"
+    read -r -s -p "الصق مفتاح النقل ثم اضغط Enter: " token; echo
+    token=${token//[$'\r\t ']/}
   fi
   [ -z "$token" ] || [[ $token =~ ^[0-9a-f]{48}$ ]] || die "مفتاح النقل غير صالح"
   self=$(readlink -f "${BASH_SOURCE[0]}")
   if [ -f "$self" ] && [ "$self" != "$(readlink -f "$SELF_DST" 2>/dev/null || true)" ]; then install -m 755 "$self" "$SELF_DST"; fi
   mkdir -p "$STATE"; chmod 700 "$STATE"
   take_lock
+  shred_export   # بقايا تشغيل سابق انقطع
+  if [ "$mode" = live ] && [ ! -f "$ETC/backend-was-live" ]; then
+    # الموقع عمل على هذه القاعدة (تحويل سابق انقطع قبل أن يكتب العلامة): لا يستبدلها نقل لاحق دون --replace
+    date -u +%FT%TZ > "$ETC/backend-was-live"
+  fi
 
   say "١/٦ تنزيل خادم البيانات (PostgREST) وخادم الدخول (GoTrue)…"
   install_backend_binaries
@@ -1410,67 +1520,89 @@ cmd_install_db() {
 
   say "٢/٦ تجهيز قاعدة $DB على PostgreSQL في السيرفر…"
   pg_checks
-  if [ "$reattach" = 1 ]; then
-    db_has_data || die "لا توجد بيانات في قاعدة السيرفر؛ انقلها بمفتاح النقل: sudo dalil-hama-site install-db <المفتاح>"
-  elif [ "$live" = 0 ] && db_has_data; then
-    # بيانات من محاولة سابقة لم تكتمل: تُستبدل بنسخة جديدة من Supabase، إلا إن عمل عليها الموقع من قبل
-    if [ -f "$ETC/backend-was-live" ] && [ "$replace" != 1 ]; then
-      die "قاعدة السيرفر عمل عليها الموقع من قبل؛ لن أستبدلها. للنقل من جديد من Supabase: sudo dalil-hama-site install-db <المفتاح> --replace"
+  case $mode in
+    live)
+      db_has_data || die "الموقع مضبوط على قاعدة السيرفر لكن قاعدة $DB مفقودة أو فارغة؛ لم أنشئ قاعدة فارغة مكانها.
+$(restore_hint)" ;;
+    reattach)
+      db_has_data || die "لا توجد بيانات في قاعدة السيرفر؛ للنقل من جديد من Supabase: sudo dalil-hama-site install-db --replace" ;;
+    transfer)
+      if db_has_data && [ -f "$ETC/backend-was-live" ] && [ "$replace" != 1 ]; then
+        die "قاعدة السيرفر عمل عليها الموقع من قبل؛ لن أستبدلها. للنقل من جديد من Supabase: sudo dalil-hama-site install-db --replace"
+      fi ;;
+  esac
+  # المخطط وواجهة الموقع من الإصدار نفسه: آخر إصدار في الفرع، إلا إن ثبّت المالك إصداراً بعينه
+  if [ -f "$BASE/PINNED" ]; then rel=$(current_sha) || die "لا يوجد إصدار مثبّت من الموقع"
+  else rel=$(remote_sha) || rel=$(current_sha) || die "تعذّر معرفة آخر إصدار من GitHub"; fi
+  fetch_release "$rel"
+  if [ "$mode" = transfer ]; then
+    say "٣/٦ نقل البيانات من Supabase (لا تعدّل شيئاً في لوحة الإدارة حتى ينتهي)…"
+    fetch_export "$token"
+    build_new_db "$rel"
+    # ما على قاعدة السيرفر الحالية يُحفظ دائماً قبل أن تحل محلها النسخة المنقولة
+    if db_has_data; then
+      ( QUIET=1 cmd_backup ) || die "تعذّرت النسخة الاحتياطية من قاعدة السيرفر الحالية؛ لم يتغير شيء"
     fi
-    if [ -f "$ETC/backend-was-live" ]; then
-      ( QUIET=1 cmd_backup ) || die "تعذّرت النسخة الاحتياطية قبل الاستبدال؛ لم يتغير شيء"
-    fi
-    systemctl stop dalil-hama-api dalil-hama-auth >/dev/null 2>&1 || true
-    pg -c "select pg_terminate_backend(pid) from pg_stat_activity where datname = '$DB' and pid <> pg_backend_pid()" >/dev/null
-    pg -c "drop database $DB" >/dev/null
+    swap_in_new_db
+    shred_export
+    ok "نُقلت البيانات ($EXPORT_APPROVED نشاطاً منشوراً)"
+  else
+    db_bootstrap
+    gotrue_migrate
+    db_owner_grants
+    app_migrations "$rel"
+    say "٣/٦ البيانات على السيرفر كما هي (لا نقل جديد)."
   fi
-  db_bootstrap
-  gotrue_migrate
-  db_owner_grants
-  app_migrations
+  pg -d "$DB" -Atc "select name from dh_meta.migrations order by 1" | LC_ALL=C sort > "$ETC/applied-migrations"
+  chmod 644 "$ETC/applied-migrations"
+  if [ "$rel" != "$(current_sha || true)" ]; then
+    activate "$rel"
+    printf '%s\n' "$rel" > "$BASE/last-checked"
+    prune
+  fi
+  rm -f -- "$BASE/.last-error"
+  fix_owner
 
-  say "٣/٦ تشغيل خدمات قاعدة البيانات…"
+  say "٤/٦ تشغيل خدمات قاعدة البيانات…"
   write_backend_configs
   start_backend
 
-  if [ "$live" = 1 ]; then
+  if [ "$mode" = live ]; then
     write_override
-    caddy_switch || die "رفض Caddy إعداد الموقع المحدّث؛ بقي كما كان"
+    caddy_switch local || die "رفض Caddy إعداد الموقع المحدّث؛ بقي كما كان"
     backend_serving || die "الموقع لا يقرأ من قاعدة السيرفر كما يجب؛ راجع: sudo dalil-hama-site status"
     install_backup_units
     fix_owner
     ok "قاعدة السيرفر وخدماتها محدّثة، والبيانات كما هي."
     return 0
   fi
-
-  if [ "$reattach" = 1 ]; then
-    say "٤/٦ البيانات على السيرفر كما هي (لا نقل جديد)."
+  if [ "$mode" = reattach ]; then
     EXPORT_APPROVED=$(pg -d "$DB" -Atc "select count(*) from public.listings where status = 'approved'")
-  else
-    say "٤/٦ نقل البيانات من Supabase…"
-    fetch_export "$token"
-    import_export
-    shred -u "$STATE/export.json" "$STATE/export.line" 2>/dev/null || rm -f -- "$STATE/export.json" "$STATE/export.line"
-    ok "نُقلت البيانات ($EXPORT_APPROVED نشاطاً منشوراً)"
   fi
 
   say "٥/٦ تحويل الموقع إلى قاعدة السيرفر…"
-  switch_abort() { trap - INT TERM HUP; rm -f -- "$BACKEND_FLAG"; caddy_switch >/dev/null 2>&1 || true; exit 130; }
+  [ -f "$ETC/backend-was-live" ] && had_marker=1
+  switch_back() {
+    rm -f -- "$BACKEND_FLAG"
+    caddy_switch supabase || true
+    if [ "$had_marker" = 0 ]; then rm -f -- "$ETC/backend-was-live"; fi
+  }
+  switch_abort() { trap - INT TERM HUP; switch_back >/dev/null 2>&1; exit 130; }
   trap switch_abort INT TERM HUP
   write_override force
   fix_owner
+  # العلامتان قبل Caddy: إن انقطع الأمر بعد التحويل، يُكمله تشغيله من جديد ولا يستبدل نقلٌ لاحق ما كُتب على السيرفر
   touch "$BACKEND_FLAG"
-  if ! caddy_switch; then
-    rm -f -- "$BACKEND_FLAG"
+  date -u +%FT%TZ > "$ETC/backend-was-live"
+  if ! caddy_switch local; then
+    switch_back
     die "رفض Caddy إعداد الموقع الجديد؛ الموقع ما زال يقرأ من Supabase كما كان"
   fi
   if ! backend_serving "$EXPORT_APPROVED"; then
-    rm -f -- "$BACKEND_FLAG"
-    caddy_switch || true
+    switch_back
     die "الموقع لم يقرأ من قاعدة السيرفر كما يجب فأعدته إلى Supabase؛ لم يتغير شيء للزوار"
   fi
   trap - INT TERM HUP
-  date -u +%FT%TZ > "$ETC/backend-was-live"
   ok "الموقع يقرأ الآن من قاعدة السيرفر"
 
   say "٦/٦ النسخ الاحتياطي الليلي…"
@@ -1479,7 +1611,8 @@ cmd_install_db() {
 
   say ""
   ok "تم. بيانات دليل حماة الآن على سيرفركم (PostgreSQL، قاعدة $DB)."
-  say "  • لوحة الإدارة تعمل بالبريد وكلمة المرور نفسيهما. سجّل الدخول من جديد إن كانت مفتوحة."
+  say "  • أغلق أي تبويب للوحة الإدارة أو للدليل كان مفتوحاً قبل النقل وافتحه من جديد؛ التبويب القديم يبقى على Supabase."
+  say "  • لوحة الإدارة تعمل بالبريد وكلمة المرور نفسيهما."
   say "  • نسخة احتياطية كل ليلة في $BACKUP_DIR (تُحفظ 14 يوماً)."
   say "  • للرجوع إلى Supabase عند الحاجة:  sudo dalil-hama-site db-rollback"
 }
@@ -1501,13 +1634,12 @@ cmd_backup() {
 cmd_db_rollback() {
   need_root db-rollback
   detect_caddy
-  [ -f "$BACKEND_FLAG" ] || die "الموقع يقرأ من Supabase أصلاً"
   take_lock
+  # الإعداد قد يبقى موجَّهاً إلى السيرفر دون العلامة (رجوع سابق انقطع بإصدار أقدم من هذا الأمر)
+  [ -f "$BACKEND_FLAG" ] || grep -q 'handle_path /rest/v1/' "$SITE_CONF" 2>/dev/null || die "الموقع يقرأ من Supabase أصلاً"
+  # العلامة تُحذف بعد نجاح التحويل فقط: انقطاع الأمر يترك الحالة «السيرفر» ويكفي تكراره
+  caddy_switch supabase || die "تعذّر تفعيل الإعداد؛ بقي الموقع على قاعدة السيرفر"
   rm -f -- "$BACKEND_FLAG"
-  if ! caddy_switch; then
-    touch "$BACKEND_FLAG"; caddy_switch || true
-    die "تعذّر تفعيل الإعداد؛ بقي الموقع على قاعدة السيرفر"
-  fi
   ok "عاد الموقع إلى قراءة البيانات من Supabase."
   warn "ما أُضيف أو عُدّل على قاعدة السيرفر منذ النقل ليس في Supabase. قاعدة السيرفر باقية كما هي."
   say "  للعودة إلى قاعدة السيرفر:  sudo dalil-hama-site install-db"

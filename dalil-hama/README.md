@@ -107,7 +107,7 @@ curl -fsSL https://raw.githubusercontent.com/aposamir/abdulmajid-alia-wedding/<c
 1. ينزّل PostgREST وGoTrue من إصداراتهما الرسمية ويتحقق من بصمتيهما.
 2. ينشئ قاعدة `dalil_hama` منفصلة عن قاعدة الموقع القديم، بالأدوار نفسها التي في Supabase (`anon` و`authenticated` و`authenticator`). تملك الجداولَ والدوالَ الدورُ `dalil_owner`، لا المستخدم الجذري لـ PostgreSQL. ثم يطبّق المخطط من `supabase/migrations` (ويسجّل ما طُبّق، فيطبّق لاحقاً الجديد فقط).
 3. يشغّل الخدمتين `dalil-hama-api` (المنفذ 8031) و`dalil-hama-auth` (المنفذ 8032) على 127.0.0.1 فقط، بمستخدم محدود `dalil-api`، بأسرار تُولَّد على السيرفر ولا تغادره (`/etc/dalil-hama-site/backend.env`).
-4. يجلب نسخة البيانات كاملة من Supabase لحظة التشغيل، عبر دالة تصدير مؤقتة محمية بالمفتاح، ويستوردها في معاملة واحدة مع التحقق من عدد كل جدول. تبقى أرقام الأنشطة كما هي، ويبقى المشرفون بكلمات مرورهم نفسها.
+4. يجلب نسخة البيانات كاملة من Supabase لحظة التشغيل، عبر دالة تصدير مؤقتة محمية بالمفتاح، ويستوردها في قاعدة مؤقتة في معاملة واحدة مع التحقق من عدد كل جدول، ثم يضعها مكان `dalil_hama` دفعة واحدة. لا تُمس قاعدة السيرفر الحالية (إن وُجدت) قبل أن ينجح كل ذلك، وتُحفظ منها نسخة احتياطية قبل الاستبدال. تبقى أرقام الأنشطة كما هي، ويبقى المشرفون بكلمات مرورهم نفسها. لا تعدّل شيئاً في لوحة الإدارة أثناء النقل، وأغلق تبويباتها المفتوحة بعده وافتحها من جديد.
 5. يوجّه Caddy المسارين `/rest/v1` و`/auth/v1` إلى الخدمتين، ويقدّم `config.js` موجّهاً إلى النطاق نفسه، ثم يتحقق أن الموقع يقرأ من السيرفر. إن فشل التحقق يعيد الموقع إلى Supabase تلقائياً.
 6. يفعّل نسخة احتياطية كل ليلة (`pg_dump`) في `/var/backups/dalil-hama-site`، تُحفظ 14 يوماً.
 
@@ -116,8 +116,15 @@ curl -fsSL https://raw.githubusercontent.com/aposamir/abdulmajid-alia-wedding/<c
 | `sudo dalil-hama-site install-db` | بعد النقل: تحديث الخدمات وتطبيق مخطط جديد إن وُجد، دون مساس بالبيانات |
 | `sudo dalil-hama-site backup` | نسخة احتياطية الآن |
 | `sudo dalil-hama-site db-rollback` | إعادة الموقع إلى Supabase (ما أُضيف على السيرفر بعد النقل لا يكون فيه) |
+| `sudo dalil-hama-site install-db` | بعد db-rollback: العودة إلى قاعدة السيرفر كما هي |
+| `sudo dalil-hama-site install-db --replace` | بعد db-rollback: نقل جديد من Supabase يحل محل قاعدة السيرفر (يطلب المفتاح، ويأخذ نسخة احتياطية قبل الاستبدال) |
 
-للاستعادة من نسخة احتياطية: `sudo -u postgres pg_restore --clean --if-exists -d dalil_hama FILE.dump`
+للاستعادة من نسخة احتياطية:
+```
+sudo systemctl stop dalil-hama-api dalil-hama-auth
+sudo cat /var/backups/dalil-hama-site/FILE.dump | sudo -u postgres pg_restore --clean --if-exists --create -d postgres
+sudo dalil-hama-site install-db
+```
 
 **ترويسات الأمان التي يضيفها Caddy:** سياسة أمان المحتوى (CSP) تسمح فقط بالنطاق نفسه وSupabase وcdnjs (مكتبة الخريطة مع تحقق SRI) وبلاطات OpenStreetMap، وHSTS، ومنع التضمين في إطارات خارجية، وسماح بالموقع الجغرافي والميكروفون لهذا الموقع وحده (لـ«الأقرب إليّ» والبحث بالصوت).
 

@@ -103,7 +103,7 @@ curl -fsSL https://raw.githubusercontent.com/aposamir/abdulmajid-alia-wedding/<c
 
 ### قاعدة البيانات على السيرفر
 
-`sudo dalil-hama-site install-db <مفتاح النقل>` ينقل البيانات من Supabase إلى PostgreSQL المحلي ويحوّل الموقع إليها:
+`sudo dalil-hama-site install-db` يطلب مفتاح النقل (يُلصق ولا يظهر على الشاشة)، ثم ينقل البيانات من Supabase إلى PostgreSQL المحلي ويحوّل الموقع إليها:
 1. ينزّل PostgREST وGoTrue من إصداراتهما الرسمية ويتحقق من بصمتيهما.
 2. ينشئ قاعدة `dalil_hama` منفصلة عن قاعدة الموقع القديم، بالأدوار نفسها التي في Supabase (`anon` و`authenticated` و`authenticator`). تملك الجداولَ والدوالَ الدورُ `dalil_owner`، لا المستخدم الجذري لـ PostgreSQL. ثم يطبّق المخطط من `supabase/migrations` (ويسجّل ما طُبّق، فيطبّق لاحقاً الجديد فقط).
 3. يشغّل الخدمتين `dalil-hama-api` (المنفذ 8031) و`dalil-hama-auth` (المنفذ 8032) على 127.0.0.1 فقط، بمستخدم محدود `dalil-api`، بأسرار تُولَّد على السيرفر ولا تغادره (`/etc/dalil-hama-site/backend.env`).

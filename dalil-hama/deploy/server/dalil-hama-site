@@ -12,8 +12,8 @@
 #   sudo dalil-hama-site rollback   إعادة النطاق إلى الموقع القديم فوراً
 #
 # قاعدة البيانات على السيرفر نفسه (PostgreSQL المحلي، مع PostgREST للبيانات وGoTrue لدخول المشرفين):
-#   sudo dalil-hama-site install-db <مفتاح النقل>   نقل البيانات من Supabase وتحويل الموقع إليها
-#   sudo dalil-hama-site install-db                 تحديث الخدمات والمخطط بعد النقل (لا يمس البيانات)
+#   sudo dalil-hama-site install-db                 أول مرة: يطلب مفتاح النقل، ثم ينقل البيانات من Supabase ويحوّل الموقع إليها
+#   sudo dalil-hama-site install-db                 بعد النقل: تحديث الخدمات والمخطط (لا يمس البيانات)
 #   sudo dalil-hama-site backup                     نسخة احتياطية الآن (تجري تلقائياً كل ليلة)
 #   sudo dalil-hama-site db-rollback                إعادة الموقع إلى Supabase
 #
@@ -589,6 +589,7 @@ json_get() { python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get(sys.
 
 # مسارات قاعدة البيانات على السيرفر (بعد النقل فقط): البيانات والدخول على النطاق نفسه،
 # وconfig.js بديل يوجّه الواجهة إليها بدل Supabase
+# (ترويسة CF-Connecting-IP يضعها الزائر نفسه هنا، لا Cloudflare، فتُحذف كي لا يتجاوز حدود الطلبات بها)
 api_routes() {
   [ -f "$BACKEND_FLAG" ] || return 0
   cat <<EOF
@@ -597,13 +598,17 @@ api_routes() {
 		request_body {
 			max_size 10MB
 		}
-		reverse_proxy 127.0.0.1:$API_PORT
+		reverse_proxy 127.0.0.1:$API_PORT {
+			header_up -Cf-Connecting-Ip
+		}
 	}
 	handle_path /auth/v1/* {
 		request_body {
 			max_size 1MB
 		}
-		reverse_proxy 127.0.0.1:$AUTH_PORT
+		reverse_proxy 127.0.0.1:$AUTH_PORT {
+			header_up -Cf-Connecting-Ip
+		}
 	}
 	handle /assets/js/config.js {
 		root * $OVERRIDE
@@ -1383,8 +1388,14 @@ cmd_install_db() {
   # reattach: الموقع عمل على قاعدة السيرفر ثم أُعيد إلى Supabase؛ نعود إليها كما هي دون نقل جديد
   local reattach=0
   if [ "$live" = 0 ] && [ -z "$token" ] && [ -z "${DH_EXPORT_FILE:-}" ]; then
-    [ -f "$ETC/backend-was-live" ] || die "اكتب مفتاح النقل بعد الأمر: sudo dalil-hama-site install-db <المفتاح>"
-    reattach=1
+    if [ -f "$ETC/backend-was-live" ]; then
+      reattach=1
+    elif [ -t 0 ]; then
+      # يُطلب المفتاح هنا كي لا يظهر في قائمة العمليات وسجل sudo
+      read -r -s -p "الصق مفتاح النقل ثم اضغط Enter: " token; echo
+    else
+      die "شغّل الأمر في الطرفية ليطلب مفتاح النقل: sudo dalil-hama-site install-db"
+    fi
   fi
   [ -z "$token" ] || [[ $token =~ ^[0-9a-f]{48}$ ]] || die "مفتاح النقل غير صالح"
   self=$(readlink -f "${BASH_SOURCE[0]}")

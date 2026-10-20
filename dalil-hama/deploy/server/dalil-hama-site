@@ -11,7 +11,13 @@
 #   sudo dalil-hama-site resume     استئناف التحديث التلقائي
 #   sudo dalil-hama-site rollback   إعادة النطاق إلى الموقع القديم فوراً
 #
-# لا يمس هذا الأمر الموقعَ القديم (خدمة dalil-hama وقاعدة بياناتها) ولا مواقع Caddy الأخرى:
+# قاعدة البيانات على السيرفر نفسه (PostgreSQL المحلي، مع PostgREST للبيانات وGoTrue لدخول المشرفين):
+#   sudo dalil-hama-site install-db <مفتاح النقل>   نقل البيانات من Supabase وتحويل الموقع إليها
+#   sudo dalil-hama-site install-db                 تحديث الخدمات والمخطط بعد النقل (لا يمس البيانات)
+#   sudo dalil-hama-site backup                     نسخة احتياطية الآن (تجري تلقائياً كل ليلة)
+#   sudo dalil-hama-site db-rollback                إعادة الموقع إلى Supabase
+#
+# لا يمس هذا الأمر الموقعَ القديم (خدمة dalil-hama وقاعدة بياناتها dalil) ولا مواقع Caddy الأخرى:
 # يستبدل كتلة dalil-hama.majid.cfd وحدها بسطر import، ويحفظ نسخة منها لإعادتها عند الرجوع.
 set -Eeuo pipefail
 umask 022
@@ -32,6 +38,25 @@ UNIT=dalil-hama-site-update
 SITE_USER=${DH_SITE_USER:-dalil-site}
 KEEP=5
 PORT=${DH_VERIFY_PORT:-443}
+
+# ─── قاعدة البيانات على السيرفر ───
+OPT=${DH_OPT:-/opt/dalil-hama-site}
+API_USER=${DH_API_USER:-dalil-api}
+DB=dalil_hama
+API_PORT=${DH_API_PORT:-8031}
+AUTH_PORT=${DH_AUTH_PORT:-8032}
+BACKUP_DIR=${DH_BACKUP_DIR:-/var/backups/dalil-hama-site}
+BACKEND_FLAG=$ETC/backend-local
+OVERRIDE=$BASE/override
+PGRST_VERSION=v13.0.7
+AUTH_VERSION=v2.197.0
+# بصمات الملفات الرسمية (x86_64 ثم aarch64)
+PGRST_SHA_X86=4153f81ccc40e7b735edc89cd84b49da25ba27eb37d57c7f6a82c9005a0b762b
+PGRST_SHA_ARM=ded5ac7f15f6655df4bb8911e5d3f50500b26d95e150e6f48009f0dfc1df6748
+AUTH_SHA_X86=9daff5d1939c3142a1586e435e6e2a7a2f71534ec40ff1b196b59b83ad5678f3
+AUTH_SHA_ARM=b129d0b32520a975a4f0576eb1b7836b82043997d2d021676ff24cec54eb5381
+SUPABASE_URL=https://jhgwzynxkioqfyoldoyx.supabase.co
+SUPABASE_KEY=sb_publishable_yeVd8p763PpAv9P8RYF3PQ_wJVYKNop
 read -r -a VERIFY_OPTS <<< "${DH_VERIFY_CURL_OPTS:-}"
 MARKER='# dalil-hama-site: الموقع الجديد لدليل حماة. للرجوع إلى القديم: sudo dalil-hama-site rollback'
 QUIET=0
@@ -222,6 +247,7 @@ activate() {
     ln -sfn "releases/$sha" "$BASE/.current.new"
     mv -Tf "$BASE/.current.new" "$BASE/current"
   fi
+  write_override
   if [ "$record" = 1 ]; then
     { grep -vx -- "$sha" "$BASE/history" 2>/dev/null || true; printf '%s\n' "$sha"; } | tail -n 20 > "$BASE/history.new"
     mv -f -- "$BASE/history.new" "$BASE/history"
@@ -561,6 +587,31 @@ PY
 
 json_get() { python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get(sys.argv[2],""))' "$1" "$2"; }
 
+# مسارات قاعدة البيانات على السيرفر (بعد النقل فقط): البيانات والدخول على النطاق نفسه،
+# وconfig.js بديل يوجّه الواجهة إليها بدل Supabase
+api_routes() {
+  [ -f "$BACKEND_FLAG" ] || return 0
+  cat <<EOF
+
+	handle_path /rest/v1/* {
+		request_body {
+			max_size 10MB
+		}
+		reverse_proxy 127.0.0.1:$API_PORT
+	}
+	handle_path /auth/v1/* {
+		request_body {
+			max_size 1MB
+		}
+		reverse_proxy 127.0.0.1:$AUTH_PORT
+	}
+	handle /assets/js/config.js {
+		root * $OVERRIDE
+		file_server
+	}
+EOF
+}
+
 write_site_conf() {
   local addresses=$1 tmp=$SITE_CONF.new
   mkdir -p "$ETC"; chmod 755 "$ETC"
@@ -593,7 +644,7 @@ $addresses {
 	redir /admin /admin/ 308
 	redir /privacy /privacy/ 301
 	respond /health "ok" 200
-
+$(api_routes)
 	file_server
 
 	handle_errors {
@@ -647,10 +698,432 @@ EOF
   chmod 644 "$UNIT_DIR/$UNIT.service" "$UNIT_DIR/$UNIT.timer"
 }
 
+# عناوين كتلة الموقع كما كُتبت في آخر تثبيت
+current_addresses() {
+  local a
+  a=$(awk '/^[^#[:space:]].*\{[[:space:]]*$/ { sub(/[[:space:]]*\{[[:space:]]*$/, ""); print; exit }' "$SITE_CONF" 2>/dev/null || true)
+  printf '%s\n' "${a:-$HOST}"
+}
+
 ensure_user() {
   id "$SITE_USER" >/dev/null 2>&1 && return 0
   useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$SITE_USER" ||
     die "تعذّر إنشاء المستخدم $SITE_USER"
+}
+
+# ─────────── قاعدة البيانات على السيرفر ───────────
+
+pg() { runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 "$@"; }
+
+# طلب HTTPS إلى الموقع عبر Caddy على السيرفر نفسه (دون وكيل)
+local_https() {
+  local path=$1; shift
+  curl -fsS --noproxy '*' --connect-timeout 3 --max-time 30 ${VERIFY_OPTS[@]+"${VERIFY_OPTS[@]}"} \
+    --resolve "$HOST:$PORT:127.0.0.1" "$@" "https://$HOST:$PORT$path"
+}
+
+port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# تنزيل ملف رسمي والتحقق من بصمته قبل أي استخدام
+fetch_verified() {
+  if [ -n "${DH_DOWNLOAD_DIR:-}" ]; then cp -- "$DH_DOWNLOAD_DIR/${1##*/}" "$3"
+  else curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 600 -o "$3" "$1" || die "تعذّر تنزيل ${1##*/}"; fi
+  [ "$(sha256sum "$3" | cut -d' ' -f1)" = "$2" ] || die "بصمة ${1##*/} لا تطابق النسخة الرسمية؛ لم يتغير شيء"
+}
+
+install_backend_binaries() {
+  local gh=https://github.com pg_url pg_sha au_url au_sha
+  case $(uname -m) in
+    x86_64|amd64)
+      pg_url=$gh/PostgREST/postgrest/releases/download/$PGRST_VERSION/postgrest-$PGRST_VERSION-linux-static-x86-64.tar.xz
+      au_url=$gh/supabase/auth/releases/download/$AUTH_VERSION/auth-$AUTH_VERSION-x86.tar.gz
+      pg_sha=$PGRST_SHA_X86; au_sha=$AUTH_SHA_X86 ;;
+    aarch64|arm64)
+      pg_url=$gh/PostgREST/postgrest/releases/download/$PGRST_VERSION/postgrest-$PGRST_VERSION-ubuntu-aarch64.tar.xz
+      au_url=$gh/supabase/auth/releases/download/$AUTH_VERSION/auth-$AUTH_VERSION-arm64.tar.gz
+      pg_sha=$PGRST_SHA_ARM; au_sha=$AUTH_SHA_ARM ;;
+    *) die "معالج السيرفر ($(uname -m)) غير مدعوم" ;;
+  esac
+  mkdir -p "$OPT"; chmod 755 "$OPT"
+  if [ ! -x "$OPT/postgrest-$PGRST_VERSION/postgrest" ]; then
+    TMP=$(mktemp -d "$OPT/.tmp.XXXXXX")
+    fetch_verified "$pg_url" "$pg_sha" "$TMP/p.tar.xz"
+    mkdir "$TMP/p"; tar -xJf "$TMP/p.tar.xz" -C "$TMP/p" --no-same-owner postgrest
+    chmod 755 "$TMP/p" "$TMP/p/postgrest"
+    mv -T "$TMP/p" "$OPT/postgrest-$PGRST_VERSION"; rm -rf -- "$TMP"; TMP=
+  fi
+  if [ ! -x "$OPT/auth-$AUTH_VERSION/auth" ]; then
+    TMP=$(mktemp -d "$OPT/.tmp.XXXXXX")
+    fetch_verified "$au_url" "$au_sha" "$TMP/a.tar.gz"
+    mkdir "$TMP/a"; tar -xzf "$TMP/a.tar.gz" -C "$TMP/a" --no-same-owner --no-same-permissions auth migrations
+    find "$TMP/a" -type d -exec chmod 755 {} +; find "$TMP/a" -type f -exec chmod 644 {} +; chmod 755 "$TMP/a/auth"
+    mv -T "$TMP/a" "$OPT/auth-$AUTH_VERSION"; rm -rf -- "$TMP"; TMP=
+  fi
+}
+
+ensure_api_user() {
+  id "$API_USER" >/dev/null 2>&1 && return 0
+  useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$API_USER" ||
+    die "تعذّر إنشاء المستخدم $API_USER"
+}
+
+# أسرار الخدمات تُولَّد على السيرفر مرة واحدة ولا تغادره
+load_secrets() {
+  local f=$ETC/backend.env
+  mkdir -p "$ETC"; chmod 755 "$ETC"
+  if [ ! -s "$f" ]; then
+    python3 -c 'import secrets
+print("JWT_SECRET=" + secrets.token_hex(32)); print("PW_API=" + secrets.token_hex(24)); print("PW_AUTH=" + secrets.token_hex(24))' > "$f.new"
+    chmod 600 "$f.new"; mv -f -- "$f.new" "$f"
+  fi
+  chmod 600 "$f"; chown root:root "$f"
+  JWT_SECRET=$(sed -n 's/^JWT_SECRET=\([0-9a-f]\{64\}\)$/\1/p' "$f")
+  PW_API=$(sed -n 's/^PW_API=\([0-9a-f]\{48\}\)$/\1/p' "$f")
+  PW_AUTH=$(sed -n 's/^PW_AUTH=\([0-9a-f]\{48\}\)$/\1/p' "$f")
+  [ -n "$JWT_SECRET" ] && [ -n "$PW_API" ] && [ -n "$PW_AUTH" ] || die "ملف الأسرار $f تالف"
+}
+
+pg_checks() {
+  local v
+  v=$(pg -Atc "show server_version_num") || die "تعذّر الاتصال بـ PostgreSQL المحلي"
+  [ "$v" -ge 130000 ] || die "PostgreSQL على السيرفر قديم ($v)؛ المطلوب 13 أو أحدث"
+  PG_PORT=$(pg -Atc "show port")
+}
+
+db_exists()   { [ "$(pg -Atc "select 1 from pg_database where datname = '$DB'")" = 1 ]; }
+db_has_data() {
+  db_exists || return 1
+  [ "$(pg -d "$DB" -Atc "select to_regclass('public.listings') is not null")" = t ] || return 1
+  [ "$(pg -d "$DB" -Atc "select exists (select 1 from public.listings)")" = t ]
+}
+
+# الأدوار كما في Supabase، وقاعدة يملكها dalil_owner (ليس المستخدم الجذري لـ PostgreSQL)
+db_bootstrap() {
+  pg -v pw_api="$PW_API" -v pw_auth="$PW_AUTH" -f - >/dev/null <<'SQL'
+do $$ begin
+  if not exists (select from pg_roles where rolname = 'anon') then create role anon nologin noinherit; end if;
+  if not exists (select from pg_roles where rolname = 'authenticated') then create role authenticated nologin noinherit; end if;
+  if not exists (select from pg_roles where rolname = 'service_role') then create role service_role nologin noinherit bypassrls; end if;
+  if not exists (select from pg_roles where rolname = 'authenticator') then create role authenticator login noinherit; end if;
+  if not exists (select from pg_roles where rolname = 'supabase_auth_admin') then create role supabase_auth_admin login noinherit; end if;
+  if not exists (select from pg_roles where rolname = 'dalil_owner') then create role dalil_owner nologin noinherit bypassrls; end if;
+end $$;
+alter role authenticator password :'pw_api';
+alter role supabase_auth_admin password :'pw_auth';
+alter role authenticator set statement_timeout = '8s';
+grant anon, authenticated, service_role to authenticator;
+select 'create database dalil_hama owner dalil_owner' where not exists (select from pg_database where datname = 'dalil_hama') \gexec
+\connect dalil_hama
+revoke all on database dalil_hama from public;
+grant connect, temporary on database dalil_hama to authenticator, supabase_auth_admin;
+create schema if not exists auth authorization supabase_auth_admin;
+create schema if not exists extensions;
+create extension if not exists pgcrypto with schema extensions;
+create schema if not exists dh_meta authorization dalil_owner;
+grant usage on schema extensions to anon, authenticated, service_role, supabase_auth_admin, dalil_owner;
+grant usage on schema auth to anon, authenticated, service_role, dalil_owner;
+grant usage on schema public to anon, authenticated, service_role;
+create table if not exists dh_meta.migrations (name text primary key, applied_at timestamptz not null default now());
+alter table dh_meta.migrations owner to dalil_owner;
+SQL
+  local who pw
+  for who in authenticator supabase_auth_admin; do
+    if [ "$who" = authenticator ]; then pw=$PW_API; else pw=$PW_AUTH; fi
+    PGPASSWORD=$pw psql -X -q -h 127.0.0.1 -p "$PG_PORT" -U "$who" -d "$DB" -Atc 'select 1' >/dev/null 2>&1 ||
+      die "PostgreSQL يرفض دخول $who بكلمة مرور من 127.0.0.1؛ أضف إلى pg_hba.conf السطر: host $DB authenticator,supabase_auth_admin 127.0.0.1/32 scram-sha-256"
+  done
+}
+
+gotrue_env() {
+  cat <<EOF
+GOTRUE_API_HOST=127.0.0.1
+PORT=$AUTH_PORT
+API_EXTERNAL_URL=https://$HOST/auth/v1
+GOTRUE_SITE_URL=https://$HOST
+GOTRUE_URI_ALLOW_LIST=https://$HOST/**
+GOTRUE_DB_DRIVER=postgres
+GOTRUE_DB_DATABASE_URL=postgres://supabase_auth_admin:$PW_AUTH@127.0.0.1:$PG_PORT/$DB?search_path=auth&sslmode=disable
+GOTRUE_DB_MIGRATIONS_PATH=$OPT/auth-$AUTH_VERSION/migrations
+GOTRUE_DB_MAX_POOL_SIZE=5
+GOTRUE_JWT_SECRET=$JWT_SECRET
+GOTRUE_JWT_EXP=3600
+GOTRUE_JWT_AUD=authenticated
+GOTRUE_JWT_DEFAULT_GROUP_NAME=authenticated
+GOTRUE_JWT_ADMIN_ROLES=service_role
+GOTRUE_DISABLE_SIGNUP=true
+GOTRUE_EXTERNAL_EMAIL_ENABLED=true
+GOTRUE_EXTERNAL_PHONE_ENABLED=false
+GOTRUE_MAILER_AUTOCONFIRM=true
+GOTRUE_PASSWORD_MIN_LENGTH=10
+GOTRUE_SECURITY_REFRESH_TOKEN_ROTATION_ENABLED=true
+GOTRUE_SECURITY_REFRESH_TOKEN_REUSE_INTERVAL=10
+GOTRUE_RATE_LIMIT_HEADER=X-Forwarded-For
+GOTRUE_LOG_LEVEL=warn
+EOF
+}
+
+gotrue_migrate() {
+  # المتغيرات تُمرَّر إلى env كما هي، دون أن تمر على الصدفة (في رابط القاعدة & وفي القائمة **)
+  local -a vars=()
+  local line
+  while IFS= read -r line; do vars+=("$line"); done < <(gotrue_env)
+  (cd "$OPT/auth-$AUTH_VERSION" && env -i PATH=/usr/bin:/bin "${vars[@]}" ./auth migrate) \
+    >"$STATE/auth-migrate.log" 2>&1 || { tail -n 5 "$STATE/auth-migrate.log" >&2; die "فشل تجهيز جداول الدخول (GoTrue)"; }
+}
+
+# ما تحتاجه دوال الدليل من جداول الدخول: إنشاء المشرفين (admin_create_user) وربط جدول admins
+db_owner_grants() {
+  pg -d "$DB" -f - >/dev/null <<'SQL'
+grant select, insert, update, references on auth.users to dalil_owner;
+grant select, insert on auth.identities to dalil_owner;
+grant select, update on auth.refresh_tokens to dalil_owner;
+SQL
+}
+
+# مخطط الدليل من مجلد supabase/migrations في الإصدار المعروض نفسه؛ كل ملف يُطبَّق مرة واحدة
+app_migrations() {
+  local sha f name
+  sha=$(current_sha) || die "لا يوجد إصدار مثبّت من الموقع"
+  TMP=$(mktemp -d "$STATE/.tmp.XXXXXX")
+  if [ -n "${DH_SOURCE_TARBALL:-}" ]; then cp -- "$DH_SOURCE_TARBALL" "$TMP/src.tgz"
+  else curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 300 -o "$TMP/src.tgz" \
+         "https://codeload.github.com/$REPO/tar.gz/$sha" || die "تعذّر تنزيل مخطط قاعدة البيانات"; fi
+  mkdir "$TMP/m"
+  tar -xzf "$TMP/src.tgz" -C "$TMP/m" --no-same-owner --wildcards --strip-components=4 \
+      "*/dalil-hama/supabase/migrations/*.sql" 2>/dev/null || die "لم أجد ملفات مخطط قاعدة البيانات في الإصدار"
+  chmod -R a+rX "$TMP"
+  for f in "$TMP"/m/*.sql; do
+    name=${f##*/}
+    [[ $name =~ ^[0-9A-Za-z_.-]+\.sql$ ]] || die "اسم ملف مخطط غير مألوف: $name"
+    [ "$(pg -d "$DB" -Atc "select count(*) from dh_meta.migrations where name = '$name'")" = 0 ] || continue
+    { echo "set role dalil_owner;"; cat -- "$f"; echo "insert into dh_meta.migrations (name) values ('$name');"; } |
+      pg -d "$DB" -1 -f - >/dev/null 2>"$STATE/migrate.log" ||
+      { cat "$STATE/migrate.log" >&2; die "فشل تطبيق $name على قاعدة السيرفر"; }
+  done
+  rm -rf -- "$TMP"; TMP=
+}
+
+write_backend_configs() {
+  local old_umask
+  old_umask=$(umask); umask 027
+  cat > "$ETC/postgrest.conf.new" <<EOF
+db-uri = "postgres://authenticator:$PW_API@127.0.0.1:$PG_PORT/$DB"
+db-schemas = "public"
+db-anon-role = "anon"
+db-extra-search-path = "public, extensions"
+db-max-rows = 1000
+db-pool = 10
+jwt-secret = "$JWT_SECRET"
+jwt-aud = "authenticated"
+openapi-mode = "disabled"
+server-host = "127.0.0.1"
+server-port = $API_PORT
+log-level = "warn"
+EOF
+  gotrue_env > "$ETC/auth.env.new"
+  umask "$old_umask"
+  chown "root:$API_USER" "$ETC/postgrest.conf.new" "$ETC/auth.env.new"
+  chmod 640 "$ETC/postgrest.conf.new" "$ETC/auth.env.new"
+  mv -f -- "$ETC/postgrest.conf.new" "$ETC/postgrest.conf"
+  mv -f -- "$ETC/auth.env.new" "$ETC/auth.env"
+}
+
+backend_unit() {   # name description exec [extra]
+  cat > "$UNIT_DIR/$1.service" <<EOF
+[Unit]
+Description=$2
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+User=$API_USER
+Group=$API_USER
+${4:-}
+ExecStart=$3
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "$UNIT_DIR/$1.service"
+}
+
+start_backend() {
+  local p u
+  for p in "$API_PORT:dalil-hama-api" "$AUTH_PORT:dalil-hama-auth"; do
+    u=${p#*:}
+    if port_in_use "${p%%:*}" && ! systemctl is-active --quiet "$u"; then
+      die "المنفذ ${p%%:*} مشغول ببرنامج آخر على السيرفر؛ لم يتغير شيء في الموقع"
+    fi
+  done
+  backend_unit dalil-hama-api "Dalil Hama: data API (PostgREST)" "$OPT/postgrest-$PGRST_VERSION/postgrest $ETC/postgrest.conf"
+  backend_unit dalil-hama-auth "Dalil Hama: admin sign-in (GoTrue)" "$OPT/auth-$AUTH_VERSION/auth serve" \
+    "EnvironmentFile=$ETC/auth.env
+WorkingDirectory=$OPT/auth-$AUTH_VERSION"
+  systemctl daemon-reload
+  systemctl enable dalil-hama-api dalil-hama-auth >/dev/null 2>&1 || true
+  systemctl restart dalil-hama-api dalil-hama-auth || die "تعذّر تشغيل خدمات قاعدة البيانات؛ راجع: journalctl -u dalil-hama-api -u dalil-hama-auth"
+  local until=$((SECONDS + 40))
+  while [ "$SECONDS" -lt "$until" ]; do
+    if curl -fsS --noproxy '*' --max-time 3 -X POST -H 'content-type: application/json' -d '{}' \
+         "http://127.0.0.1:$API_PORT/rpc/sync" >/dev/null 2>&1 &&
+       curl -fsS --noproxy '*' --max-time 3 "http://127.0.0.1:$AUTH_PORT/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "خدمات قاعدة البيانات لم تستجب؛ راجع: journalctl -u dalil-hama-api -u dalil-hama-auth"
+}
+
+# نسخة البيانات من Supabase عبر دالة التصدير المؤقتة المحمية بمفتاح النقل
+fetch_export() {
+  local out=$STATE/export.json
+  rm -f -- "$out"
+  if [ -n "${DH_EXPORT_FILE:-}" ]; then cp -- "$DH_EXPORT_FILE" "$out"
+  else
+    printf '{"p_token":"%s"}' "$1" | curl -fsS --compressed --connect-timeout 20 --max-time 180 -X POST \
+      -H "apikey: $SUPABASE_KEY" -H 'content-type: application/json' --data-binary @- \
+      -o "$out" "$SUPABASE_URL/rest/v1/rpc/dh_server_export" || die "تعذّر الاتصال بـ Supabase لنقل البيانات"
+  fi
+  chmod 600 "$out"
+  EXPORT_APPROVED=$(python3 - "$out" "$STATE/export.line" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+if not isinstance(d, dict) or d.get('format') != 1 or not d.get('listings') or not d.get('admins'):
+    sys.exit(1)
+open(sys.argv[2], 'w', encoding='utf-8').write(json.dumps(d, ensure_ascii=False, separators=(',', ':')))
+print(sum(1 for l in d['listings'] if l.get('status') == 'approved'))
+PY
+) || die "مفتاح النقل غير صحيح أو انتهت صلاحيته؛ لم يتغير شيء في الموقع"
+  chmod 600 "$STATE/export.line"
+}
+
+import_export() {
+  {
+    cat <<'SQL'
+\set ON_ERROR_STOP on
+begin;
+set local session_replication_role = replica;
+create temp table imp (j jsonb) on commit drop;
+copy imp from stdin with (format csv, quote e'\x01', delimiter e'\x02');
+SQL
+    cat -- "$STATE/export.line"
+    printf '\n\\.\n'
+    cat <<'SQL'
+create function pg_temp.load(tbl regclass, data jsonb) returns integer language plpgsql as $$
+declare cols text; n integer;
+begin
+  if data is null or jsonb_array_length(data) = 0 then return 0; end if;
+  select string_agg(quote_ident(a.attname), ', ' order by a.attnum) into cols
+    from pg_attribute a
+   where a.attrelid = tbl and a.attnum > 0 and not a.attisdropped and a.attgenerated = ''
+     and (data -> 0) ? a.attname;
+  execute format('insert into %s (%s) select %s from jsonb_populate_recordset(null::%s, $1)', tbl, cols, cols, tbl) using data;
+  get diagnostics n = row_count;
+  return n;
+end $$;
+
+do $$
+declare d jsonb := (select j from imp); r record; got integer; want integer;
+begin
+  if exists (select 1 from public.listings) then raise exception 'server database already has data; refusing to overwrite'; end if;
+  delete from public.settings;
+  for r in select * from (values
+      (1, 'auth.users', 'users'), (2, 'auth.identities', 'identities'),
+      (3, 'public.categories', 'categories'), (4, 'public.areas', 'areas'),
+      (5, 'public.listings', 'listings'), (6, 'public.listing_stats', 'listing_stats'),
+      (7, 'public.reports', 'reports'), (8, 'public.settings', 'settings'),
+      (9, 'public.admins', 'admins'), (10, 'public.daily_stats', 'daily_stats'),
+      (11, 'public.search_terms', 'search_terms'), (12, 'public.audit_log', 'audit_log'),
+      (13, 'private.tombstones', 'tombstones'), (14, 'private.track_seen', 'track_seen')) v(o, tbl, key) order by o
+  loop
+    got := pg_temp.load(r.tbl::regclass, d -> r.key);
+    want := coalesce(jsonb_array_length(d -> r.key), 0);
+    if got <> want then raise exception '% rows: got % expected %', r.tbl, got, want; end if;
+  end loop;
+  perform setval(pg_get_serial_sequence('public.categories', 'id'), greatest((select max(id) from public.categories), (d #>> '{sequences,categories}')::bigint, 1));
+  perform setval(pg_get_serial_sequence('public.areas', 'id'), greatest((select max(id) from public.areas), (d #>> '{sequences,areas}')::bigint, 1));
+  perform setval(pg_get_serial_sequence('public.listings', 'id'), greatest((select max(id) from public.listings), (d #>> '{sequences,listings}')::bigint, 1000000));
+  perform setval(pg_get_serial_sequence('public.reports', 'id'), greatest((select max(id) from public.reports), (d #>> '{sequences,reports}')::bigint, 1));
+  perform setval(pg_get_serial_sequence('public.audit_log', 'id'), greatest((select max(id) from public.audit_log), (d #>> '{sequences,audit_log}')::bigint, 1));
+end $$;
+commit;
+SQL
+  } | pg -d "$DB" -f - >"$STATE/import.log" 2>&1 || { tail -n 5 "$STATE/import.log" >&2; die "فشل استيراد البيانات إلى قاعدة السيرفر"; }
+}
+
+# config.js الإصدار الحالي، موجَّهاً إلى قاعدة السيرفر (يُعاد مع كل إصدار جديد)
+write_override() {
+  [ -f "$BACKEND_FLAG" ] || [ "${1:-}" = force ] || return 0
+  local src=$BASE/current/assets/js/config.js dir=$OVERRIDE/assets/js
+  [ -f "$src" ] || return 0
+  mkdir -p "$dir"
+  sed -E -e "s#^export const SUPABASE_URL = .*#export const SUPABASE_URL = '';#" \
+         -e "s#^export const SUPABASE_KEY = .*#export const SUPABASE_KEY = 'local';#" "$src" > "$dir/config.js.new"
+  grep -q "^export const SUPABASE_URL = '';" "$dir/config.js.new" || printf "export const SUPABASE_URL = '';\n" >> "$dir/config.js.new"
+  chmod 644 "$dir/config.js.new"; chmod 755 "$OVERRIDE" "$OVERRIDE/assets" "$dir"
+  mv -f -- "$dir/config.js.new" "$dir/config.js"
+}
+
+backend_serving() {   # expected number of published listings (or empty to skip)
+  local until=$((SECONDS + 30)) n
+  while [ "$SECONDS" -lt "$until" ]; do
+    if local_https /assets/js/config.js -H 'Cache-Control: no-cache' 2>/dev/null | grep -q "^export const SUPABASE_URL = '';" &&
+       local_https /auth/v1/health 2>/dev/null | grep -q GoTrue; then
+      n=$(local_https /rest/v1/rpc/sync -X POST -H 'content-type: application/json' -d '{}' 2>/dev/null |
+          python3 -c 'import json,sys; print(len(json.load(sys.stdin)["items"]))' 2>/dev/null) || n=
+      if [ -n "$n" ] && { [ -z "${1:-}" ] || [ "$n" = "$1" ]; }; then return 0; fi
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+install_backup_units() {
+  cat > "$UNIT_DIR/dalil-hama-site-backup.service" <<EOF
+[Unit]
+Description=Dalil Hama: nightly database backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=$SELF_DST backup --quiet
+EOF
+  cat > "$UNIT_DIR/dalil-hama-site-backup.timer" <<EOF
+[Unit]
+Description=Dalil Hama: nightly database backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 644 "$UNIT_DIR/dalil-hama-site-backup.service" "$UNIT_DIR/dalil-hama-site-backup.timer"
+  systemctl daemon-reload
+  systemctl enable --now dalil-hama-site-backup.timer >/dev/null 2>&1 || warn "تعذّر تفعيل النسخ الاحتياطي الليلي"
+}
+
+caddy_switch() {   # يعيد كتابة إعداد الموقع ويفعّله؛ يعيد 1 دون تغيير إن رفضه Caddy
+  local addresses backup=$STATE/site.caddy.switch.bak
+  addresses=$(current_addresses)
+  cp -p -- "$SITE_CONF" "$backup"
+  write_site_conf "$addresses"
+  if ! caddy_validate || ! caddy_reload; then
+    cp -p -- "$backup" "$SITE_CONF"; caddy_reload || true
+    return 1
+  fi
 }
 
 # ─────────── الأوامر ───────────
@@ -703,9 +1176,7 @@ cmd_install() {
   if [ "$status" = patch ]; then
     addresses=$(json_get "$analysis" addresses)
   else
-    # مثبّت من قبل: نُبقي العناوين المكتوبة في الملف الحالي
-    addresses=$(awk '/^[^#[:space:]].*\{[[:space:]]*$/ { sub(/[[:space:]]*\{[[:space:]]*$/, ""); print; exit }' "$SITE_CONF" 2>/dev/null || true)
-    [ -n "$addresses" ] || addresses=$HOST
+    addresses=$(current_addresses)
   fi
 
   restore_files() {
@@ -899,6 +1370,138 @@ cmd_rollback() {
   say "  لإعادة الموقع الجديد لاحقاً:  sudo dalil-hama-site install"
 }
 
+cmd_install_db() {
+  need_root install-db
+  local token='' replace=0 a live=0 self
+  for a in "$@"; do case $a in --replace) replace=1 ;; *) token=$a ;; esac; done
+  need_tools curl tar xz python3 flock psql pg_dump runuser sha256sum
+  load_conf
+  detect_caddy
+  [ -f "$STATE/patched-file" ] && [ -L "$BASE/current" ] || die "ثبّت الموقع أولاً: sudo dalil-hama-site install"
+  systemctl is-active --quiet postgresql || die "PostgreSQL لا يعمل على هذا السيرفر"
+  [ -f "$BACKEND_FLAG" ] && live=1
+  # reattach: الموقع عمل على قاعدة السيرفر ثم أُعيد إلى Supabase؛ نعود إليها كما هي دون نقل جديد
+  local reattach=0
+  if [ "$live" = 0 ] && [ -z "$token" ] && [ -z "${DH_EXPORT_FILE:-}" ]; then
+    [ -f "$ETC/backend-was-live" ] || die "اكتب مفتاح النقل بعد الأمر: sudo dalil-hama-site install-db <المفتاح>"
+    reattach=1
+  fi
+  [ -z "$token" ] || [[ $token =~ ^[0-9a-f]{48}$ ]] || die "مفتاح النقل غير صالح"
+  self=$(readlink -f "${BASH_SOURCE[0]}")
+  if [ -f "$self" ] && [ "$self" != "$(readlink -f "$SELF_DST" 2>/dev/null || true)" ]; then install -m 755 "$self" "$SELF_DST"; fi
+  mkdir -p "$STATE"; chmod 700 "$STATE"
+  take_lock
+
+  say "١/٦ تنزيل خادم البيانات (PostgREST) وخادم الدخول (GoTrue)…"
+  install_backend_binaries
+  ensure_api_user
+  load_secrets
+
+  say "٢/٦ تجهيز قاعدة $DB على PostgreSQL في السيرفر…"
+  pg_checks
+  if [ "$reattach" = 1 ]; then
+    db_has_data || die "لا توجد بيانات في قاعدة السيرفر؛ انقلها بمفتاح النقل: sudo dalil-hama-site install-db <المفتاح>"
+  elif [ "$live" = 0 ] && db_has_data; then
+    # بيانات من محاولة سابقة لم تكتمل: تُستبدل بنسخة جديدة من Supabase، إلا إن عمل عليها الموقع من قبل
+    if [ -f "$ETC/backend-was-live" ] && [ "$replace" != 1 ]; then
+      die "قاعدة السيرفر عمل عليها الموقع من قبل؛ لن أستبدلها. للنقل من جديد من Supabase: sudo dalil-hama-site install-db <المفتاح> --replace"
+    fi
+    if [ -f "$ETC/backend-was-live" ]; then
+      ( QUIET=1 cmd_backup ) || die "تعذّرت النسخة الاحتياطية قبل الاستبدال؛ لم يتغير شيء"
+    fi
+    systemctl stop dalil-hama-api dalil-hama-auth >/dev/null 2>&1 || true
+    pg -c "select pg_terminate_backend(pid) from pg_stat_activity where datname = '$DB' and pid <> pg_backend_pid()" >/dev/null
+    pg -c "drop database $DB" >/dev/null
+  fi
+  db_bootstrap
+  gotrue_migrate
+  db_owner_grants
+  app_migrations
+
+  say "٣/٦ تشغيل خدمات قاعدة البيانات…"
+  write_backend_configs
+  start_backend
+
+  if [ "$live" = 1 ]; then
+    write_override
+    caddy_switch || die "رفض Caddy إعداد الموقع المحدّث؛ بقي كما كان"
+    backend_serving || die "الموقع لا يقرأ من قاعدة السيرفر كما يجب؛ راجع: sudo dalil-hama-site status"
+    install_backup_units
+    fix_owner
+    ok "قاعدة السيرفر وخدماتها محدّثة، والبيانات كما هي."
+    return 0
+  fi
+
+  if [ "$reattach" = 1 ]; then
+    say "٤/٦ البيانات على السيرفر كما هي (لا نقل جديد)."
+    EXPORT_APPROVED=$(pg -d "$DB" -Atc "select count(*) from public.listings where status = 'approved'")
+  else
+    say "٤/٦ نقل البيانات من Supabase…"
+    fetch_export "$token"
+    import_export
+    shred -u "$STATE/export.json" "$STATE/export.line" 2>/dev/null || rm -f -- "$STATE/export.json" "$STATE/export.line"
+    ok "نُقلت البيانات ($EXPORT_APPROVED نشاطاً منشوراً)"
+  fi
+
+  say "٥/٦ تحويل الموقع إلى قاعدة السيرفر…"
+  switch_abort() { trap - INT TERM HUP; rm -f -- "$BACKEND_FLAG"; caddy_switch >/dev/null 2>&1 || true; exit 130; }
+  trap switch_abort INT TERM HUP
+  write_override force
+  fix_owner
+  touch "$BACKEND_FLAG"
+  if ! caddy_switch; then
+    rm -f -- "$BACKEND_FLAG"
+    die "رفض Caddy إعداد الموقع الجديد؛ الموقع ما زال يقرأ من Supabase كما كان"
+  fi
+  if ! backend_serving "$EXPORT_APPROVED"; then
+    rm -f -- "$BACKEND_FLAG"
+    caddy_switch || true
+    die "الموقع لم يقرأ من قاعدة السيرفر كما يجب فأعدته إلى Supabase؛ لم يتغير شيء للزوار"
+  fi
+  trap - INT TERM HUP
+  date -u +%FT%TZ > "$ETC/backend-was-live"
+  ok "الموقع يقرأ الآن من قاعدة السيرفر"
+
+  say "٦/٦ النسخ الاحتياطي الليلي…"
+  install_backup_units
+  ( QUIET=1 cmd_backup ) || warn "تعذّرت النسخة الاحتياطية الأولى؛ جرّب: sudo dalil-hama-site backup"
+
+  say ""
+  ok "تم. بيانات دليل حماة الآن على سيرفركم (PostgreSQL، قاعدة $DB)."
+  say "  • لوحة الإدارة تعمل بالبريد وكلمة المرور نفسيهما. سجّل الدخول من جديد إن كانت مفتوحة."
+  say "  • نسخة احتياطية كل ليلة في $BACKUP_DIR (تُحفظ 14 يوماً)."
+  say "  • للرجوع إلى Supabase عند الحاجة:  sudo dalil-hama-site db-rollback"
+}
+
+cmd_backup() {
+  [ "${1:-}" = --quiet ] && QUIET=1
+  need_root backup
+  db_exists || die "لا توجد قاعدة $DB على هذا السيرفر"
+  mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+  local out
+  out=$BACKUP_DIR/$DB-$(date -u +%Y%m%d-%H%M%S).dump
+  runuser -u postgres -- pg_dump -Fc "$DB" > "$out.tmp" || { rm -f -- "$out.tmp"; die "فشل النسخ الاحتياطي"; }
+  [ "$(stat -c%s "$out.tmp")" -gt 2000 ] || { rm -f -- "$out.tmp"; die "النسخة الاحتياطية صغيرة على نحو غير طبيعي؛ لم تُحفظ"; }
+  chmod 600 "$out.tmp"; mv -f -- "$out.tmp" "$out"
+  find "$BACKUP_DIR" -maxdepth 1 -name "$DB-*.dump" -mtime +14 -delete
+  ok "نسخة احتياطية: $out ($(du -h "$out" | cut -f1))"
+}
+
+cmd_db_rollback() {
+  need_root db-rollback
+  detect_caddy
+  [ -f "$BACKEND_FLAG" ] || die "الموقع يقرأ من Supabase أصلاً"
+  take_lock
+  rm -f -- "$BACKEND_FLAG"
+  if ! caddy_switch; then
+    touch "$BACKEND_FLAG"; caddy_switch || true
+    die "تعذّر تفعيل الإعداد؛ بقي الموقع على قاعدة السيرفر"
+  fi
+  ok "عاد الموقع إلى قراءة البيانات من Supabase."
+  warn "ما أُضيف أو عُدّل على قاعدة السيرفر منذ النقل ليس في Supabase. قاعدة السيرفر باقية كما هي."
+  say "  للعودة إلى قاعدة السيرفر:  sudo dalil-hama-site install-db"
+}
+
 unit_state() {
   local st
   st=$(systemctl is-active "$1" 2>/dev/null) || true
@@ -934,10 +1537,20 @@ cmd_status() {
   else say "التحديث التلقائي:   $(unit_state "$UNIT.timer")"; fi
   if [ -s "$BASE/.last-error" ]; then say "آخر خطأ في التحديث:  $(cat "$BASE/.last-error")"; fi
   say "الموقع القديم:      $(unit_state dalil-hama)"
+  if [ -f "$BACKEND_FLAG" ]; then
+    local n last
+    n=$(pg -d "$DB" -Atc "select count(*) from public.listings where status = 'approved'" 2>/dev/null) || n="؟"
+    last=$(find "$BACKUP_DIR" -maxdepth 1 -name "$DB-*.dump" -printf '%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null | sort | tail -n 1)
+    say "قاعدة البيانات:     السيرفر ($DB، $n نشاطاً منشوراً)"
+    say "خدمة البيانات:      $(unit_state dalil-hama-api)    خدمة الدخول: $(unit_state dalil-hama-auth)"
+    say "آخر نسخة احتياطية:  ${last:-لا يوجد}"
+  else
+    say "قاعدة البيانات:     Supabase"
+  fi
 }
 
 usage() {
-  sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"
 }
 
 case ${1:-} in
@@ -947,5 +1560,8 @@ case ${1:-} in
   resume)   cmd_resume ;;
   rollback) cmd_rollback ;;
   status)   cmd_status ;;
+  install-db)  shift; cmd_install_db "$@" ;;
+  backup)      shift; cmd_backup "$@" ;;
+  db-rollback) cmd_db_rollback ;;
   *)        usage; exit 2 ;;
 esac

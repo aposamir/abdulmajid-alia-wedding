@@ -40,10 +40,15 @@ TMP=
 cleanup() { [ -n "$TMP" ] && rm -rf -- "$TMP"; return 0; }
 trap cleanup EXIT
 
-say()  { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+say()  { [ "$QUIET" = 1 ] || printf '%s\n' "$*" || true; }
 ok()   { say "✓ $*"; }
-warn() { printf '! %s\n' "$*" >&2; }
-die()  { printf '✗ %s\n' "$*" >&2; exit 1; }
+warn() { printf '! %s\n' "$*" >&2 || true; }
+die()  {
+  # أخطاء التحديث التلقائي تُحفظ ليعرضها أمر status
+  if [ -n "${ERRLOG:-}" ]; then printf '%s  %s\n' "$(date -u +%FT%TZ)" "$*" > "$ERRLOG" 2>/dev/null || true; fi
+  printf '✗ %s\n' "$*" >&2 || true
+  exit 1
+}
 
 need_root() { [ "$(id -u)" -eq 0 ] || die "شغّل الأمر بصلاحية الجذر: sudo $0 $*"; }
 
@@ -57,14 +62,23 @@ is_sha() { [[ ${1:-} =~ ^[0-9a-f]{40}$ ]]; }
 # إعدادات اختيارية في $CONF بصيغة KEY=VALUE (REPO وBRANCH فقط)، تُقرأ ولا تُنفَّذ
 load_conf() {
   [ -r "$CONF" ] || return 0
-  local key val
-  while IFS='=' read -r key val; do
-    val=${val%$'\r'}; val=${val#\"}; val=${val%\"}
+  local line key val
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    [[ $line =~ ^[[:space:]]*(REPO|BRANCH)[[:space:]]*=(.*)$ ]] || continue
+    key=${BASH_REMATCH[1]}
+    val=${BASH_REMATCH[2]%%[[:space:]]#*}
+    val=$(printf '%s' "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^[\"']//" -e "s/[\"']\$//")
     case $key in
-      REPO)   [ -z "${DH_REPO:-}" ]   && [[ $val =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && REPO=$val ;;
-      BRANCH) [ -z "${DH_BRANCH:-}" ] && [[ $val =~ ^[A-Za-z0-9._/-]+$ ]] && BRANCH=$val ;;
+      REPO)
+        if [[ $val =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then [ -n "${DH_REPO:-}" ] || REPO=$val
+        else warn "تجاهلت السطر REPO=$val في $CONF"; fi ;;
+      BRANCH)
+        if [[ $val =~ ^[A-Za-z0-9._/-]+$ ]]; then [ -n "${DH_BRANCH:-}" ] || BRANCH=$val
+        else warn "تجاهلت السطر BRANCH=$val في $CONF"; fi ;;
     esac
-  done < <(grep -E '^(REPO|BRANCH)=' "$CONF" || true)
+  done < "$CONF"
+  return 0
 }
 
 take_lock() {
@@ -122,11 +136,42 @@ wait_served() {
   return 1
 }
 
+# إصدار مرفوض يُعلَّم فلا يُعاد تنزيله كل 10 دقائق ما دام رأس الفرع لم يتغير
+reject_release() {
+  printf '%s\n' "$2" > "$BASE/bad-$1" 2>/dev/null || true
+  die "الإصدار ${1:0:7} مرفوض: $2؛ الموقع باقٍ على الإصدار الحالي"
+}
+
+# صفحات فيها <script> مضمَّن (غير JSON): سياسة أمان المحتوى على السيرفر تمنع تشغيله
+inline_scripts() {
+  python3 - "$1" <<'PY'
+import os, re, sys
+root, bad = sys.argv[1], []
+for d, _, fs in os.walk(root):
+    for f in fs:
+        if not f.endswith('.html'): continue
+        p = os.path.join(d, f)
+        for a in re.findall(r'<script\b([^>]*)>', open(p, encoding='utf-8', errors='replace').read(), re.I):
+            if re.search(r'\bsrc\s*=', a, re.I) or re.search(r'type\s*=\s*["\']?application/(ld\+)?json', a, re.I):
+                continue
+            bad.append(os.path.relpath(p, root)); break
+print(' '.join(sorted(bad)))
+PY
+}
+
+# بصمة محتوى الإصدار (دون release.txt)، لتمييز الإصدارات التي لم تغيّر ملفات الموقع
+release_digest() {
+  (cd "$1" && find . -type f ! -name release.txt -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum) |
+    sha256sum | cut -c1-64
+}
+
 # ينزّل الإصدار ويتحقق منه في مجلد مؤقت، ثم ينقله دفعة واحدة إلى releases/<sha>
 fetch_release() {
-  local sha=$1 dir=$BASE/releases/$1 f
+  local sha=$1 dir=$BASE/releases/$1 f bad
   [ -d "$dir" ] && return 0
   mkdir -p "$BASE/releases"
+  # بقايا تنزيل انقطع (إعادة تشغيل أو إيقاف قسري)؛ القفل بأيدينا فلا تنزيل آخر جارٍ
+  rm -rf -- "$BASE"/.tmp.*
   TMP=$(mktemp -d "$BASE/.tmp.XXXXXX")
   if [ -n "${DH_SOURCE_TARBALL:-}" ]; then
     cp -- "$DH_SOURCE_TARBALL" "$TMP/src.tgz"
@@ -135,15 +180,20 @@ fetch_release() {
       "https://codeload.github.com/$REPO/tar.gz/$sha" || die "تعذّر تنزيل الإصدار ${sha:0:7} من GitHub"
   fi
   mkdir "$TMP/site"
-  tar -xzf "$TMP/src.tgz" -C "$TMP/site" --no-same-owner --no-same-permissions \
-      --wildcards --strip-components=3 "*/$SUBDIR/*" 2>/dev/null || die "الملف المنزَّل لا يحوي مجلد $SUBDIR"
+  if ! tar -xzf "$TMP/src.tgz" -C "$TMP/site" --no-same-owner --no-same-permissions \
+       --wildcards --strip-components=3 "*/$SUBDIR/*" 2>"$TMP/tar.log"; then
+    if grep -q 'Not found in archive' "$TMP/tar.log"; then reject_release "$sha" "لا يحوي مجلد $SUBDIR"; fi
+    die "تعذّر فك الإصدار ${sha:0:7}: $(tail -n 1 "$TMP/tar.log")"
+  fi
   # ملفات ومجلدات عادية فقط
   find "$TMP/site" -mindepth 1 ! -type f ! -type d -delete
   for f in index.html admin/index.html sw.js manifest.webmanifest assets/js/app.js assets/js/admin.js \
            assets/js/core.js assets/js/search.js assets/js/config.js assets/css/app.css; do
-    [ -s "$TMP/site/$f" ] || die "الإصدار ${sha:0:7} ناقص ($f)؛ لم يتغير شيء"
+    [ -s "$TMP/site/$f" ] || reject_release "$sha" "ملف ناقص ($f)"
   done
-  grep -q '/assets/js/app.js' "$TMP/site/index.html" || die "الإصدار ${sha:0:7} غير صالح؛ لم يتغير شيء"
+  grep -q '/assets/js/app.js' "$TMP/site/index.html" || reject_release "$sha" "الصفحة الرئيسية غير صالحة"
+  bad=$(inline_scripts "$TMP/site") || bad="(تعذّر الفحص)"
+  [ -z "$bad" ] || reject_release "$sha" "فيه سكربت مضمَّن تمنعه سياسة الأمان ($bad)"
   printf '%s\n' "$sha" > "$TMP/site/release.txt"
   find "$TMP/site" -type d -exec chmod 755 {} +
   find "$TMP/site" -type f -exec chmod 644 {} +
@@ -151,29 +201,46 @@ fetch_release() {
   rm -rf -- "$TMP"; TMP=
 }
 
-# تبديل ذري للرابط current، مع حفظ الإصدار السابق
+# سجل الإصدارات المعروضة (الأحدث آخراً)، يرجع خلاله أمر previous خطوة خطوة
+ensure_history() {
+  [ -s "$BASE/history" ] && return 0
+  local cur prev
+  cur=$(current_sha) || return 0
+  prev=$(cat "$BASE/previous" 2>/dev/null) || prev=
+  {
+    if is_sha "$prev" && [ "$prev" != "$cur" ] && [ -d "$BASE/releases/$prev" ]; then printf '%s\n' "$prev"; fi
+    printf '%s\n' "$cur"
+  } > "$BASE/history"
+  rm -f -- "$BASE/previous"
+}
+
+# تبديل ذري للرابط current؛ record=1 يضع الإصدار في آخر السجل
 activate() {
-  local sha=$1 cur
+  local sha=$1 record=${2:-1} cur
   cur=$(current_sha) || cur=
-  [ "$cur" = "$sha" ] && return 0
-  ln -sfn "releases/$sha" "$BASE/.current.new"
-  mv -Tf "$BASE/.current.new" "$BASE/current"
-  [ -n "$cur" ] && printf '%s\n' "$cur" > "$BASE/previous"
+  if [ "$cur" != "$sha" ]; then
+    ln -sfn "releases/$sha" "$BASE/.current.new"
+    mv -Tf "$BASE/.current.new" "$BASE/current"
+  fi
+  if [ "$record" = 1 ]; then
+    { grep -vx -- "$sha" "$BASE/history" 2>/dev/null || true; printf '%s\n' "$sha"; } | tail -n 20 > "$BASE/history.new"
+    mv -f -- "$BASE/history.new" "$BASE/history"
+  fi
   return 0
 }
 
+# يُبقي الإصدار الحالي والمثبّت وآخر $KEEP إصدارات في السجل، ويحذف ما عداها
 prune() {
-  local cur prev d s n=0
+  local keep cur d s
   cur=$(current_sha) || cur=
-  prev=$(cat "$BASE/previous" 2>/dev/null) || prev=
-  while IFS= read -r d; do
+  keep=" $cur $(cat "$BASE/PINNED" 2>/dev/null || true) $(tail -n "$KEEP" "$BASE/history" 2>/dev/null | tr '\n' ' ') "
+  for d in "$BASE"/releases/*/; do
     d=${d%/}; s=${d##*/}
     is_sha "$s" || continue
-    if [ "$s" = "$cur" ] || [ "$s" = "$prev" ]; then continue; fi
-    n=$((n + 1))
-    [ "$n" -lt "$KEEP" ] && continue
+    case $keep in *" $s "*) continue ;; esac
     rm -rf -- "${BASE:?}/releases/$s"
-  done < <(ls -1dt "$BASE"/releases/*/ 2>/dev/null || true)
+  done
+  return 0
 }
 
 fix_owner() {
@@ -201,6 +268,29 @@ detect_caddy() {
 caddy_validate() { caddy validate --config "$CADDYFILE" --adapter caddyfile >"$STATE/validate.log" 2>&1; }
 caddy_adapt()    { caddy adapt --config "$CADDYFILE" --adapter caddyfile >"$1" 2>"$STATE/adapt.log"; }
 caddy_reload()   { systemctl reload caddy >"$STATE/reload.log" 2>&1; }
+
+# الإعداد الذي يعمل به Caddy الآن (من واجهة الإدارة المحلية)، لمقارنته بالملف على القرص
+caddy_running() {
+  local admin
+  admin=$(python3 -c 'import json,sys
+a = json.load(open(sys.argv[1])).get("admin") or {}
+print("off" if a.get("disabled") else (a.get("listen") or "localhost:2019"))' "$1" 2>/dev/null) || return 1
+  admin=${admin#tcp/}; admin=${admin%%|*}
+  case $admin in
+    off) return 1 ;;
+    unix/*) curl -fsS --noproxy '*' --max-time 5 --unix-socket "${admin#unix/}" http://localhost/config/ >"$2" 2>/dev/null ;;
+    :*) curl -fsS --noproxy '*' --max-time 5 "http://localhost$admin/config/" >"$2" 2>/dev/null ;;
+    *) curl -fsS --noproxy '*' --max-time 5 "http://$admin/config/" >"$2" 2>/dev/null ;;
+  esac
+}
+
+# مواقع (غير الدليل) يختلف إعدادها على القرص عمّا يعمل به Caddy؛ فارغ إن تطابقا أو تعذّر الفحص
+pending_edits() {
+  caddy_running "$STATE/adapt-before.json" "$STATE/running.json" || { echo "?"; return 0; }
+  local r
+  r=$(caddy_patch compare "$STATE/adapt-before.json" "$HOST" "$STATE/running.json" "$STATE")
+  [ "$(json_get "$r" status)" = same ] || json_get "$r" hosts
+}
 
 # يحلل ملفات Caddy ويستبدل كتلة النطاق (أو يعيدها)؛ لا يكتب شيئاً في وضع analyze
 caddy_patch() {
@@ -423,6 +513,10 @@ def main():
         text, bom = read_text(f)
         lines = text.split('\n')
         idx = [k for k, l in enumerate(lines) if code_part(l).strip() == IMPORT_LINE]
+        if not idx and old.rstrip('\n') in text:
+            # أُعيدت الكتلة القديمة من قبل (رجوع سابق أو انقطع قبل إعادة التحميل)
+            print(json.dumps({'status': 'unpatched', 'file': f, 'already': True}, ensure_ascii=False))
+            return
         if len(idx) != 1:
             fail('لم أجد سطر الموقع الجديد في %s' % f)
         k = idx[0]
@@ -436,8 +530,10 @@ def main():
         before = routes_of(json.load(open(caddyfile, encoding='utf-8')))
         after = routes_of(json.load(open(site_conf, encoding='utf-8')))
         if before != after:
-            hosts = sorted({h for r in set(before) ^ set(after) for h in json.loads(r)[1]}) or ['(بلا نطاق)']
-            fail('التعديل كان سيغيّر مواقع أخرى في Caddy: %s' % ', '.join(hosts))
+            hosts = ', '.join(sorted({h for r in set(before) ^ set(after) for h in json.loads(r)[1]}) or ['(بلا نطاق)'])
+            print(json.dumps({'status': 'error', 'hosts': hosts,
+                              'error': 'التعديل كان سيغيّر مواقع أخرى في Caddy: %s' % hosts}, ensure_ascii=False))
+            return
         print(json.dumps({'status': 'same'}))
 
 def routes_of(cfg):
@@ -482,7 +578,7 @@ $addresses {
 		Referrer-Policy "strict-origin-when-cross-origin"
 		Permissions-Policy "camera=(), geolocation=(self), microphone=(self)"
 		Cross-Origin-Opener-Policy "same-origin"
-		Content-Security-Policy "default-src 'self'; script-src 'self' 'sha256-eKTws3IEpyLgPZy+jhsFIc3StBddPnlt4UVAYvIMEKg=' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: blob: https://tile.openstreetmap.org https://cdnjs.cloudflare.com; font-src 'self'; connect-src 'self' https://jhgwzynxkioqfyoldoyx.supabase.co; manifest-src 'self'; worker-src 'self'; frame-src 'none'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; upgrade-insecure-requests"
+		Content-Security-Policy "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; img-src 'self' data: blob: https://tile.openstreetmap.org https://cdnjs.cloudflare.com; font-src 'self'; connect-src 'self' https://jhgwzynxkioqfyoldoyx.supabase.co; manifest-src 'self'; worker-src 'self'; frame-src 'none'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; upgrade-insecure-requests"
 		-Server
 	}
 
@@ -573,10 +669,13 @@ cmd_install() {
   say "١/٤ تنزيل الموقع الجديد من GitHub…"
   ensure_user
   take_lock
+  ensure_history
   sha=$(remote_sha) || die "تعذّر معرفة آخر إصدار من GitHub ($REPO / $BRANCH)"
   fetch_release "$sha"
   activate "$sha"
-  rm -f "$BASE/PINNED"
+  printf '%s\n' "$sha" > "$BASE/last-checked"
+  rm -f -- "$BASE/PINNED" "$BASE/.last-error"
+  prune
   fix_owner
   ok "الإصدار ${sha:0:7} جاهز في $BASE/current"
 
@@ -587,6 +686,14 @@ cmd_install() {
   analysis=$(caddy_patch analyze "$CADDYFILE" "$HOST" "$SITE_CONF" "$STATE")
   status=$(json_get "$analysis" status)
   [ "$status" = error ] && die "$(json_get "$analysis" error)؛ لم يتغير شيء في Caddy"
+  if [ "$status" = already ] && [ "$(served_sha || true)" != "$sha" ]; then
+    # تثبيت سابق انقطع قبل التحقق: نعيد كتلة الموقع القديم إلى الملف أولاً ثم نثبّت من البداية
+    analysis=$(caddy_patch unpatch "$CADDYFILE" "$HOST" "$SITE_CONF" "$STATE")
+    [ "$(json_get "$analysis" status)" = unpatched ] || die "$(json_get "$analysis" error)؛ لم يتغير شيء في Caddy"
+    analysis=$(caddy_patch analyze "$CADDYFILE" "$HOST" "$SITE_CONF" "$STATE")
+    status=$(json_get "$analysis" status)
+    [ "$status" = patch ] || die "$(json_get "$analysis" error)؛ لم يتغير شيء في Caddy"
+  fi
   file=$(json_get "$analysis" file)
   ts=$(date +%Y%m%d-%H%M%S)
   backup="$STATE/$(basename "$file").$ts.bak"
@@ -613,7 +720,19 @@ cmd_install() {
   if [ "$status" = patch ]; then
     caddy_adapt "$STATE/adapt-before.json" ||
       { cat "$STATE/adapt.log" >&2; die "تعذّرت قراءة إعداد Caddy الحالي؛ لم يتغير شيء"; }
+    # إعادة التحميل تفعّل الملف كله؛ تعديلات معلّقة على مواقع أخرى (n8n مثلاً) ستعمل معه
+    local pending
+    pending=$(pending_edits)
+    if [ "$pending" = "?" ]; then
+      warn "تعذّرت قراءة الإعداد العامل من Caddy، فلم أتحقق من التعديلات المعلّقة"
+    elif [ -n "$pending" ]; then
+      die "ملف Caddy فيه تعديلات لم تُفعَّل بعد على: $pending. فعّلها (systemctl reload caddy) أو ألغها أولاً؛ لم يتغير شيء"
+    fi
   fi
+
+  # انقطاع الجلسة أو Ctrl+C أثناء التعديل: نعيد الملفات كما كانت قبل الخروج
+  on_abort() { trap - INT TERM HUP; restore_files 2>/dev/null || true; caddy_reload || true; exit 130; }
+  trap on_abort INT TERM HUP
   write_site_conf "$addresses"
   if [ "$status" = patch ]; then
     analysis=$(caddy_patch apply "$CADDYFILE" "$HOST" "$SITE_CONF" "$STATE")
@@ -649,6 +768,7 @@ cmd_install() {
     restore
     die "Caddy لم يعرض الموقع الجديد خلال 30 ثانية فأعدت كل شيء كما كان؛ الموقع القديم يعمل كما هو"
   fi
+  trap - INT TERM HUP
   ok "النطاق https://$HOST يعرض الآن الموقع الجديد"
 
   say "٤/٤ تفعيل التحديث التلقائي…"
@@ -666,44 +786,72 @@ cmd_install() {
 
 cmd_update() {
   [ "${1:-}" = --quiet ] && QUIET=1
-  need_tools curl tar flock find
+  need_tools curl tar flock find python3 sha256sum
   load_conf
   take_lock
+  ERRLOG=$BASE/.last-error
+  ensure_history
   if [ -f "$BASE/PINNED" ]; then
     say "التحديث التلقائي موقوف على الإصدار $(cut -c1-7 "$BASE/PINNED"). لاستئنافه: sudo dalil-hama-site resume"
     return 0
   fi
-  local sha cur
+  local sha cur f
   sha=$(remote_sha) || die "تعذّر معرفة آخر إصدار من GitHub ($REPO / $BRANCH)"
   cur=$(current_sha) || cur=
-  if [ "$sha" = "$cur" ]; then
-    say "الموقع على آخر إصدار (${sha:0:7})"
-  else
-    fetch_release "$sha"
-    activate "$sha"
-    prune
-    fix_owner
-    printf 'dalil-hama-site: %s -> %s\n' "${cur:0:7}" "${sha:0:7}"
+  # علامات رفض لرؤوس فرع سابقة لم تعد تلزم
+  for f in "$BASE"/bad-*; do
+    if [ -e "$f" ] && [ "$f" != "$BASE/bad-$sha" ]; then rm -f -- "$f"; fi
+  done
+  if [ -f "$BASE/bad-$sha" ]; then
+    say "آخر إصدار (${sha:0:7}) مرفوض: $(cat "$BASE/bad-$sha")؛ الموقع باقٍ على ${cur:0:7}"
+    return 0
   fi
+  if [ "$sha" = "$cur" ] || [ "$sha" = "$(cat "$BASE/last-checked" 2>/dev/null || true)" ]; then
+    rm -f -- "$ERRLOG"
+    say "الموقع على آخر إصدار (${cur:0:7})"
+    return 0
+  fi
+  fetch_release "$sha"
+  if [ -n "$cur" ] && [ -d "$BASE/releases/$cur" ] &&
+     [ "$(release_digest "$BASE/releases/$sha")" = "$(release_digest "$BASE/releases/$cur")" ]; then
+    # الإصدار لم يغيّر ملفات الموقع (تعديل في جزء آخر من المستودع): يبقى المعروض كما هو
+    rm -rf -- "${BASE:?}/releases/$sha"
+    printf '%s\n' "$sha" > "$BASE/last-checked"
+    rm -f -- "$ERRLOG"
+    fix_owner
+    say "لا تغيير في ملفات الموقع في ${sha:0:7}؛ يبقى الإصدار ${cur:0:7}"
+    return 0
+  fi
+  activate "$sha"
+  printf '%s\n' "$sha" > "$BASE/last-checked"
+  prune
+  rm -f -- "$ERRLOG"
+  fix_owner
+  printf 'dalil-hama-site: %s -> %s\n' "${cur:0:7}" "${sha:0:7}"
 }
 
 cmd_previous() {
   need_root previous
   take_lock
+  ensure_history
   local prev cur
-  prev=$(cat "$BASE/previous" 2>/dev/null) || prev=
-  is_sha "$prev" && [ -d "$BASE/releases/$prev" ] || die "لا يوجد إصدار سابق محفوظ"
   cur=$(current_sha) || cur=
-  activate "$prev"
+  # الإصدار الذي سبق الحالي في السجل؛ تكرار الأمر يرجع خطوة أخرى إلى الوراء
+  prev=$(awk -v c="$cur" '$0 == c { print p; exit } { p = $0 }' "$BASE/history" 2>/dev/null) || prev=
+  if ! is_sha "$prev" || [ ! -d "$BASE/releases/$prev" ]; then
+    die "لا يوجد إصدار أقدم محفوظ من ${cur:0:7}"
+  fi
+  activate "$prev" 0
   printf '%s\n' "$prev" > "$BASE/PINNED"
+  rm -f -- "$BASE/last-checked"
   fix_owner
   ok "رجع الموقع إلى الإصدار ${prev:0:7} (كان ${cur:0:7})، وأُوقف التحديث التلقائي."
-  say "  لاستئناف التحديث:  sudo dalil-hama-site resume"
+  say "  للرجوع خطوة أخرى كرّر الأمر. لاستئناف التحديث:  sudo dalil-hama-site resume"
 }
 
 cmd_resume() {
   need_root resume
-  rm -f "$BASE/PINNED"
+  rm -f -- "$BASE/PINNED" "$BASE/last-checked"
   cmd_update
 }
 
@@ -717,8 +865,14 @@ cmd_rollback() {
   ts=$(date +%Y%m%d-%H%M%S)
   backup="$STATE/$(basename "$file").$ts.before-rollback.bak"
   cp -p -- "$file" "$backup"
-  local guard=0
+  local guard=0 pending
   caddy_adapt "$STATE/adapt-before.json" && guard=1
+  if [ "$guard" = 1 ]; then
+    pending=$(pending_edits)
+    if [ -n "$pending" ] && [ "$pending" != "?" ]; then
+      warn "تنبيه: في ملف Caddy تعديلات لم تُفعَّل بعد على: $pending، وستُفعَّل مع الرجوع"
+    fi
+  fi
   r=$(caddy_patch unpatch "$CADDYFILE" "$HOST" "$SITE_CONF" "$STATE")
   [ "$(json_get "$r" status)" = unpatched ] || die "$(json_get "$r" error)"
   if [ "$guard" = 1 ]; then
@@ -745,21 +899,41 @@ cmd_rollback() {
   say "  لإعادة الموقع الجديد لاحقاً:  sudo dalil-hama-site install"
 }
 
+unit_state() {
+  local st
+  st=$(systemctl is-active "$1" 2>/dev/null) || true
+  case $st in
+    active) echo "يعمل" ;;
+    inactive) echo "متوقف" ;;
+    failed) echo "متعطّل" ;;
+    activating|reloading) echo "يبدأ" ;;
+    '') echo "غير معروف" ;;
+    *) echo "$st" ;;
+  esac
+}
+
 cmd_status() {
   load_conf
-  local cur served remote
+  local cur served remote note=
   cur=$(current_sha) || cur=
   served=$(served_sha) || served=
   remote=$(remote_sha) || remote=
+  if [ -n "$remote" ] && [ "$remote" != "$cur" ]; then
+    if [ -f "$BASE/bad-$remote" ]; then note=" (مرفوض: $(cat "$BASE/bad-$remote"))"
+    elif [ "$remote" = "$(cat "$BASE/last-checked" 2>/dev/null || true)" ]; then note=" (لا تغيير في ملفات الموقع)"
+    else note=" (يُطبَّق خلال 10 دقائق)"; fi
+  fi
   say "النطاق:            https://$HOST"
   say "المصدر:            github.com/$REPO ($BRANCH)"
   say "الإصدار المثبّت:    ${cur:0:7}"
   if [ -n "$served" ]; then say "الإصدار المعروض:    ${served:0:7}"
   else say "الإصدار المعروض:    — (النطاق لا يعرض الموقع الجديد)"; fi
-  say "آخر إصدار متاح:     ${remote:0:7}"
-  [ -f "$BASE/PINNED" ] && say "التحديث التلقائي:   موقوف (sudo dalil-hama-site resume)" ||
-    say "التحديث التلقائي:   $(systemctl is-active "$UNIT.timer" 2>/dev/null || echo غير مفعّل)"
-  say "الموقع القديم:      $(systemctl is-active dalil-hama 2>/dev/null || echo غير موجود)"
+  if [ -n "$remote" ]; then say "آخر إصدار متاح:     ${remote:0:7}$note"
+  else say "آخر إصدار متاح:     — (تعذّر الوصول إلى GitHub)"; fi
+  if [ -f "$BASE/PINNED" ]; then say "التحديث التلقائي:   موقوف (sudo dalil-hama-site resume)"
+  else say "التحديث التلقائي:   $(unit_state "$UNIT.timer")"; fi
+  if [ -s "$BASE/.last-error" ]; then say "آخر خطأ في التحديث:  $(cat "$BASE/.last-error")"; fi
+  say "الموقع القديم:      $(unit_state dalil-hama)"
 }
 
 usage() {

@@ -1,8 +1,9 @@
 // عامل الخدمة: يجعل الدليل يعمل بسرعة وحتى دون إنترنت بعد أول زيارة.
-const VERSION = 'dh-v2';
+const VERSION = 'dh-v3';
 const SHELL = [
   '/',
   '/assets/css/app.css?v=2',
+  '/assets/js/theme.js?v=3',
   '/assets/js/app.js?v=2',
   '/assets/js/core.js',
   '/assets/js/search.js',
@@ -12,6 +13,8 @@ const SHELL = [
   '/assets/fonts/plex-arabic-700.woff2',
   '/manifest.webmanifest',
 ];
+
+const OWN = /^\/(?:assets\/|manifest\.webmanifest$|favicon\.svg$)/;
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -49,6 +52,10 @@ self.addEventListener('fetch', (e) => {
     );
     return;
   }
+
+  // ما عدا الصفحات لا نتعامل إلا مع ملفات الدليل الثابتة؛ أي طلب آخر على النطاق
+  // (مثل /api/ إن أُعيد الموقع القديم يوماً) يذهب إلى الشبكة مباشرة دون تخزين
+  if (!OWN.test(url.pathname)) return;
 
   // السكربتات والأنماط: الشبكة أولاً حتى لا تختلط وحدات JS قديمة بجديدة بعد كل تحديث
   if (/\.(?:js|css)$/.test(url.pathname)) {

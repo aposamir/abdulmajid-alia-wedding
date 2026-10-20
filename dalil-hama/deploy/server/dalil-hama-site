@@ -202,7 +202,11 @@ release_digest() {
 # ينزّل الإصدار ويتحقق منه في مجلد مؤقت، ثم ينقله دفعة واحدة إلى releases/<sha>
 fetch_release() {
   local sha=$1 dir=$BASE/releases/$1 f bad
-  [ -d "$dir" ] && return 0
+  if [ -d "$dir" ]; then
+    if [ -f "$BASE/releases/$sha.migrations" ] || [ "$sha" = "$(current_sha || true)" ]; then return 0; fi
+    # مجلد بلا قائمة مخطط (من نسخة أقدم من هذا الأمر): يُنزَّل من جديد كي لا يُتجاوز فحص المخطط
+    rm -rf -- "$dir"
+  fi
   mkdir -p "$BASE/releases"
   # بقايا تنزيل انقطع (إعادة تشغيل أو إيقاف قسري)؛ القفل بأيدينا فلا تنزيل آخر جارٍ
   rm -rf -- "$BASE"/.tmp.*
@@ -231,10 +235,13 @@ fetch_release() {
   printf '%s\n' "$sha" > "$TMP/site/release.txt"
   find "$TMP/site" -type d -exec chmod 755 {} +
   find "$TMP/site" -type f -exec chmod 644 {} +
-  mv -T "$TMP/site" "$dir"
-  # ملفات مخطط قاعدة البيانات التي يتطلبها هذا الإصدار (للتحقق قبل تفعيله على قاعدة السيرفر)
+  # ملفات مخطط قاعدة البيانات التي يتطلبها هذا الإصدار (للتحقق قبل تفعيله على قاعدة السيرفر)،
+  # تُكتب قبل نقل المجلد: مجلد بلا قائمة لا يظهر أبداً حتى لو انقطع الأمر بينهما
   { tar -tzf "$TMP/src.tgz" --wildcards "*/dalil-hama/supabase/migrations/*.sql" 2>/dev/null || true; } |
-    sed 's#.*/##' | LC_ALL=C sort > "$BASE/releases/$sha.migrations"
+    sed 's#.*/##' | LC_ALL=C sort > "$TMP/migrations"
+  chmod 644 "$TMP/migrations"
+  mv -f -- "$TMP/migrations" "$BASE/releases/$sha.migrations"
+  mv -T "$TMP/site" "$dir"
   rm -rf -- "$TMP"; TMP=
 }
 
@@ -819,9 +826,14 @@ pg_checks() {
   v=$(pg -Atc "show server_version_num") || die "تعذّر الاتصال بـ PostgreSQL المحلي"
   [ "$v" -ge 130000 ] || die "PostgreSQL على السيرفر قديم ($v)؛ المطلوب 13 أو أحدث"
   PG_PORT=$(pg -Atc "show port")
+}
+
+# قاعدة موجودة بغير UTF8 (عنقود مهيّأ بلغة C) لا تُكتب فيها نصوص عربية
+db_utf8_or_die() {
   local enc
   enc=$(pg -Atc "select pg_encoding_to_char(encoding) from pg_database where datname = '$DB'")
-  [ -z "$enc" ] || [ "$enc" = UTF8 ] || die "قاعدة $DB على السيرفر بترميز $enc لا UTF8؛ لن أكتب فيها نصوصاً عربية"
+  [ -z "$enc" ] || [ "$enc" = UTF8 ] ||
+    die "قاعدة $DB على السيرفر بترميز $enc لا UTF8؛ لن أكتب فيها نصوصاً عربية. لنقل جديد في قاعدة UTF8 (مع نسخة احتياطية من الحالية): sudo dalil-hama-site db-rollback ثم sudo dalil-hama-site install-db --replace"
 }
 
 db_exists()   { [ "$(pg -Atc "select 1 from pg_database where datname = '$DB'")" = 1 ]; }
@@ -1145,7 +1157,7 @@ restore_hint() {
   local last
   last=$(ls -1t -- "$BACKUP_DIR/$DB-"*.dump 2>/dev/null | head -n 1) || last=
   if [ -z "$last" ]; then printf 'لا توجد نسخة احتياطية في %s' "$BACKUP_DIR"; return 0; fi
-  printf 'لاسترجاع آخر نسخة احتياطية (%s):\n  sudo systemctl stop dalil-hama-api dalil-hama-auth\n  sudo cat %s | sudo -u postgres pg_restore --clean --if-exists --create -d postgres\n  sudo dalil-hama-site install-db' \
+  printf 'لاسترجاع آخر نسخة احتياطية (%s):\n  sudo systemctl stop dalil-hama-api dalil-hama-auth\n  sudo cat %s | sudo -u postgres pg_restore --clean --if-exists --create -d postgres\n  sudo systemctl start dalil-hama-api dalil-hama-auth\n  sudo dalil-hama-site install-db' \
     "${last##*/}" "$last"
 }
 
@@ -1486,6 +1498,9 @@ cmd_install_db() {
   load_conf
   detect_caddy
   [ -f "$STATE/patched-file" ] && [ -L "$BASE/current" ] || die "ثبّت الموقع أولاً: sudo dalil-hama-site install"
+  # بعد rollback إلى الموقع القديم لا يمر النطاق بإعداد الموقع الجديد، فلا معنى لتحويل قاعدته
+  [ "$(json_get "$(caddy_patch analyze "$CADDYFILE" "$HOST" "$SITE_CONF" "$STATE" 2>/dev/null || echo '{}')" status)" = already ] ||
+    die "النطاق لا يعرض الموقع الجديد الآن؛ شغّل أولاً: sudo dalil-hama-site install"
   systemctl is-active --quiet postgresql || die "PostgreSQL لا يعمل على هذا السيرفر"
   # live: الموقع يعمل على قاعدة السيرفر، فتحديث للخدمات والمخطط فقط
   # reattach: عمل عليها ثم أُعيد إلى Supabase، فنعود إليها كما هي دون نقل جديد
@@ -1498,9 +1513,13 @@ cmd_install_db() {
   fi
   if [ "$mode" = transfer ] && [ -z "$token" ] && [ -z "${DH_EXPORT_FILE:-}" ]; then
     # يُطلب المفتاح هنا كي لا يظهر في قائمة العمليات وسجل sudo
-    [ -t 0 ] || die "شغّل الأمر في الطرفية ليطلب مفتاح النقل: sudo dalil-hama-site install-db"
+    if [ ! -t 0 ]; then
+      if [ "$replace" = 1 ]; then die "شغّل الأمر في الطرفية ليطلب مفتاح النقل: sudo dalil-hama-site install-db --replace"; fi
+      die "شغّل الأمر في الطرفية ليطلب مفتاح النقل: sudo dalil-hama-site install-db"
+    fi
     read -r -s -p "الصق مفتاح النقل ثم اضغط Enter: " token; echo
     token=${token//[$'\r\t ']/}
+    [ -n "$token" ] || die "لم يُلصق مفتاح النقل؛ لم يتغير شيء"
   fi
   [ -z "$token" ] || [[ $token =~ ^[0-9a-f]{48}$ ]] || die "مفتاح النقل غير صالح"
   self=$(readlink -f "${BASH_SOURCE[0]}")
@@ -1520,21 +1539,43 @@ cmd_install_db() {
 
   say "٢/٦ تجهيز قاعدة $DB على PostgreSQL في السيرفر…"
   pg_checks
+  # نسخة منقولة من تشغيل سابق انقطع (فيها بيانات المشرفين)؛ لا تلزم بين تشغيل وآخر
+  drop_db "${DB}_new"
   case $mode in
     live)
+      db_utf8_or_die
       db_has_data || die "الموقع مضبوط على قاعدة السيرفر لكن قاعدة $DB مفقودة أو فارغة؛ لم أنشئ قاعدة فارغة مكانها.
 $(restore_hint)" ;;
     reattach)
-      db_has_data || die "لا توجد بيانات في قاعدة السيرفر؛ للنقل من جديد من Supabase: sudo dalil-hama-site install-db --replace" ;;
+      db_utf8_or_die
+      db_has_data || die "لا توجد بيانات في قاعدة السيرفر.
+$(restore_hint)
+أو للنقل من جديد من Supabase: sudo dalil-hama-site install-db --replace" ;;
     transfer)
       if db_has_data && [ -f "$ETC/backend-was-live" ] && [ "$replace" != 1 ]; then
         die "قاعدة السيرفر عمل عليها الموقع من قبل؛ لن أستبدلها. للنقل من جديد من Supabase: sudo dalil-hama-site install-db --replace"
       fi ;;
   esac
-  # المخطط وواجهة الموقع من الإصدار نفسه: آخر إصدار في الفرع، إلا إن ثبّت المالك إصداراً بعينه
-  if [ -f "$BASE/PINNED" ]; then rel=$(current_sha) || die "لا يوجد إصدار مثبّت من الموقع"
-  else rel=$(remote_sha) || rel=$(current_sha) || die "تعذّر معرفة آخر إصدار من GitHub"; fi
-  fetch_release "$rel"
+  # المخطط وواجهة الموقع من الإصدار نفسه: آخر إصدار في الفرع إن كان سليماً، وإلا الإصدار المعروض
+  rel=
+  if [ ! -f "$BASE/PINNED" ]; then rel=$(remote_sha) || rel=; fi
+  if [ -n "$rel" ] && [ -f "$BASE/bad-$rel" ]; then
+    warn "آخر إصدار (${rel:0:7}) مرفوض: $(cat "$BASE/bad-$rel")؛ أبقيت الإصدار الحالي"
+    rel=
+  fi
+  if [ -n "$rel" ]; then
+    # يُجرَّب في عملية فرعية: إصدار مرفوض لا يوقف الأمر بل يبقى الإصدار الحالي
+    set +e; ( set -e; fetch_release "$rel" ) 2>"$STATE/fetch.log"; a=$?; set -e
+    if [ "$a" != 0 ]; then
+      a=$(sed -n 's/^✗ //p' "$STATE/fetch.log" | head -n 1)
+      warn "${a%؛ الموقع باقٍ على الإصدار الحالي}؛ أبقيت الإصدار الحالي"
+      rel=
+    fi
+  fi
+  if [ -z "$rel" ]; then
+    rel=$(current_sha) || die "لا يوجد إصدار مثبّت من الموقع"
+    fetch_release "$rel"
+  fi
   if [ "$mode" = transfer ]; then
     say "٣/٦ نقل البيانات من Supabase (لا تعدّل شيئاً في لوحة الإدارة حتى ينتهي)…"
     fetch_export "$token"
@@ -1666,6 +1707,7 @@ cmd_status() {
   remote=$(remote_sha) || remote=
   if [ -n "$remote" ] && [ "$remote" != "$cur" ]; then
     if [ -f "$BASE/bad-$remote" ]; then note=" (مرفوض: $(cat "$BASE/bad-$remote"))"
+    elif [ -n "$(missing_migrations "$remote" | tr -d ' ')" ]; then note=" (ينتظر تحديث قاعدة البيانات: sudo dalil-hama-site install-db)"
     elif [ "$remote" = "$(cat "$BASE/last-checked" 2>/dev/null || true)" ]; then note=" (لا تغيير في ملفات الموقع)"
     else note=" (يُطبَّق خلال 10 دقائق)"; fi
   fi

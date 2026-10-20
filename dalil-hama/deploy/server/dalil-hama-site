@@ -183,7 +183,7 @@ fetch_release() {
   if ! tar -xzf "$TMP/src.tgz" -C "$TMP/site" --no-same-owner --no-same-permissions \
        --wildcards --strip-components=3 "*/$SUBDIR/*" 2>"$TMP/tar.log"; then
     if grep -q 'Not found in archive' "$TMP/tar.log"; then reject_release "$sha" "لا يحوي مجلد $SUBDIR"; fi
-    die "تعذّر فك الإصدار ${sha:0:7}: $(tail -n 1 "$TMP/tar.log")"
+    die "تعذّر فك الإصدار ${sha:0:7}: $(head -n 1 "$TMP/tar.log")"
   fi
   # ملفات ومجلدات عادية فقط
   find "$TMP/site" -mindepth 1 ! -type f ! -type d -delete
@@ -610,6 +610,7 @@ EOF
   mv -f "$tmp" "$SITE_CONF"
 }
 
+# بلا RestrictSUIDSGID: يحجب openat2 كلياً، وtar 1.35 (Ubuntu 24.04) يستخدمه لفتح المجلدات أثناء الفك
 install_units() {
   cat > "$UNIT_DIR/$UNIT.service" <<EOF
 [Unit]
@@ -629,7 +630,6 @@ ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
-RestrictSUIDSGID=yes
 ReadWritePaths=$BASE
 EOF
   cat > "$UNIT_DIR/$UNIT.timer" <<EOF

@@ -118,13 +118,11 @@ curl -fsSL https://raw.githubusercontent.com/aposamir/abdulmajid-alia-wedding/<c
 | `sudo dalil-hama-site db-rollback` | إعادة الموقع إلى Supabase (ما أُضيف على السيرفر بعد النقل لا يكون فيه) |
 | `sudo dalil-hama-site install-db` | بعد db-rollback: العودة إلى قاعدة السيرفر كما هي |
 | `sudo dalil-hama-site install-db --replace` | بعد db-rollback: نقل جديد من Supabase يحل محل قاعدة السيرفر (يطلب المفتاح، ويأخذ نسخة احتياطية قبل الاستبدال) |
+| `sudo dalil-hama-site db-restore [FILE]` | استرجاع آخر نسخة احتياطية (أو الملف المذكور) مكان قاعدة السيرفر، ثم تشغيل الخدمات والتحقق |
 
-للاستعادة من نسخة احتياطية:
-```
-sudo systemctl stop dalil-hama-api dalil-hama-auth
-sudo cat /var/backups/dalil-hama-site/FILE.dump | sudo -u postgres pg_restore --clean --if-exists --create -d postgres
-sudo dalil-hama-site install-db
-```
+`db-restore` يسترجع النسخة في قاعدة مؤقتة أولاً ولا يمس القاعدة الحالية حتى ينجح (ويحفظ منها نسخة قبل الاستبدال)، وينشئ أدوار PostgreSQL إن كانت مفقودة، فيصلح أيضاً بعد إعادة تثبيت PostgreSQL. النسخ التي تُؤخذ قبل الاستبدال أو الاسترجاع (`dalil_hama-before-*.dump`) لا تُحذف مع التدوير.
+
+`install-db` و`db-rollback` لا يفعّلان إعداد Caddy إن كان فيه تعديل لم يُفعَّل بعد على موقع آخر (n8n مثلاً): فعّله أو ألغه أولاً.
 
 **ترويسات الأمان التي يضيفها Caddy:** سياسة أمان المحتوى (CSP) تسمح فقط بالنطاق نفسه وSupabase وcdnjs (مكتبة الخريطة مع تحقق SRI) وبلاطات OpenStreetMap، وHSTS، ومنع التضمين في إطارات خارجية، وسماح بالموقع الجغرافي والميكروفون لهذا الموقع وحده (لـ«الأقرب إليّ» والبحث بالصوت).
 

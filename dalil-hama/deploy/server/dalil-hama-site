@@ -16,6 +16,7 @@
 #   sudo dalil-hama-site install-db                 بعد النقل: تحديث الخدمات والمخطط (لا يمس البيانات)
 #   sudo dalil-hama-site install-db --replace       نقل جديد من Supabase يحل محل قاعدة السيرفر (بعد db-rollback، مع نسخة احتياطية قبله)
 #   sudo dalil-hama-site backup                     نسخة احتياطية الآن (تجري تلقائياً كل ليلة)
+#   sudo dalil-hama-site db-restore [FILE]          استرجاع آخر نسخة احتياطية (أو FILE) مكان قاعدة السيرفر
 #   sudo dalil-hama-site db-rollback                إعادة الموقع إلى Supabase
 #
 # لا يمس هذا الأمر الموقعَ القديم (خدمة dalil-hama وقاعدة بياناتها dalil) ولا مواقع Caddy الأخرى:
@@ -760,6 +761,11 @@ local_https() {
 
 port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
+# ما يعرضه Caddy فعلاً الآن: config.js الموجَّه إلى قاعدة السيرفر أم إعداد Supabase
+site_on_server() {
+  grep -q "^export const SUPABASE_URL = '';" <<< "$(local_https /assets/js/config.js -H 'Cache-Control: no-cache' 2>/dev/null || true)"
+}
+
 # تنزيل ملف رسمي والتحقق من بصمته قبل أي استخدام
 fetch_verified() {
   if [ -n "${DH_DOWNLOAD_DIR:-}" ]; then cp -- "$DH_DOWNLOAD_DIR/${1##*/}" "$3"
@@ -844,8 +850,9 @@ db_has_data() {
 }
 
 # الأدوار كما في Supabase، وقاعدة يملكها dalil_owner (ليس المستخدم الجذري لـ PostgreSQL)
-db_bootstrap() {
-  pg -v db="$DB" -v pw_api="$PW_API" -v pw_auth="$PW_AUTH" -f - >/dev/null <<'SQL'
+# الأدوار وكلمات مرورها؛ تلزم قبل أي استرجاع أيضاً (النسخة الاحتياطية لا تحمل الأدوار)
+db_roles() {
+  pg -v pw_api="$PW_API" -v pw_auth="$PW_AUTH" -f - >/dev/null <<'SQL'
 set client_min_messages = warning;
 do $$ begin
   if not exists (select from pg_roles where rolname = 'anon') then create role anon nologin noinherit; end if;
@@ -861,6 +868,13 @@ alter role authenticator set statement_timeout = '8s';
 alter role anon set statement_timeout = '3s';
 alter role authenticated set statement_timeout = '8s';
 grant anon, authenticated, service_role to authenticator;
+SQL
+}
+
+db_bootstrap() {
+  db_roles
+  pg -v db="$DB" -f - >/dev/null <<'SQL'
+set client_min_messages = warning;
 -- UTF8 صراحةً: عناقيد PostgreSQL المهيّأة بلغة C تكون SQL_ASCII، فتُعدّ الحروف العربية بالبايت
 select format('create database %I owner dalil_owner encoding ''UTF8'' lc_collate ''C.UTF-8'' lc_ctype ''C.UTF-8'' template template0', :'db')
  where not exists (select from pg_database where datname = :'db') \gexec
@@ -1157,8 +1171,7 @@ restore_hint() {
   local last
   last=$(ls -1t -- "$BACKUP_DIR/$DB-"*.dump 2>/dev/null | head -n 1) || last=
   if [ -z "$last" ]; then printf 'لا توجد نسخة احتياطية في %s' "$BACKUP_DIR"; return 0; fi
-  printf 'لاسترجاع آخر نسخة احتياطية (%s):\n  sudo systemctl stop dalil-hama-api dalil-hama-auth\n  sudo cat %s | sudo -u postgres pg_restore --clean --if-exists --create -d postgres\n  sudo systemctl start dalil-hama-api dalil-hama-auth\n  sudo dalil-hama-site install-db' \
-    "${last##*/}" "$last"
+  printf 'لاسترجاع آخر نسخة احتياطية (%s):  sudo dalil-hama-site db-restore' "${last##*/}"
 }
 
 # config.js الإصدار الحالي، موجَّهاً إلى قاعدة السيرفر (يُعاد مع كل إصدار جديد)
@@ -1223,11 +1236,25 @@ EOF
 }
 
 caddy_switch() {   # local|supabase: يعيد كتابة إعداد الموقع ويفعّله؛ يعيد 1 دون تغيير إن رفضه Caddy
-  local ROUTES=$1 addresses backup=$STATE/site.caddy.switch.bak
+  local ROUTES=$1 addresses backup=$STATE/site.caddy.switch.bak pending
+  # إعادة التحميل تفعّل ملف Caddy كله: لا تُفعَّل معها تعديلات معلّقة على مواقع أخرى (n8n)
+  if caddy_adapt "$STATE/adapt-before.json"; then
+    pending=$(pending_edits)
+    if [ -n "$pending" ] && [ "$pending" != "?" ]; then
+      warn "ملف Caddy فيه تعديلات لم تُفعَّل بعد على: $pending. فعّلها (sudo systemctl reload caddy) أو ألغها أولاً"
+      return 1
+    fi
+  fi
   addresses=$(current_addresses)
   cp -p -- "$SITE_CONF" "$backup"
   write_site_conf "$addresses"
-  if ! caddy_validate || ! caddy_reload; then
+  if ! caddy_validate; then
+    tail -n 5 "$STATE/validate.log" >&2 || true
+    cp -p -- "$backup" "$SITE_CONF"
+    return 1
+  fi
+  if ! caddy_reload; then
+    tail -n 5 "$STATE/reload.log" >&2 || true
     cp -p -- "$backup" "$SITE_CONF"; caddy_reload || true
     return 1
   fi
@@ -1492,7 +1519,7 @@ cmd_rollback() {
 
 cmd_install_db() {
   need_root install-db
-  local token='' replace=0 a self mode rel had_marker=0
+  local token='' replace=0 a self mode rel had_marker=0 resume=0 switched=0
   for a in "$@"; do case $a in --replace) replace=1 ;; *) token=$a ;; esac; done
   need_tools curl tar xz python3 flock psql pg_dump runuser sha256sum shred
   load_conf
@@ -1505,7 +1532,13 @@ cmd_install_db() {
   # live: الموقع يعمل على قاعدة السيرفر، فتحديث للخدمات والمخطط فقط
   # reattach: عمل عليها ثم أُعيد إلى Supabase، فنعود إليها كما هي دون نقل جديد
   # transfer: نقل جديد من Supabase بمفتاح النقل
-  if [ -f "$BACKEND_FLAG" ]; then mode=live
+  if [ -f "$BACKEND_FLAG" ]; then
+    mode=live
+    if [ -f "$ETC/switch-pending" ] && ! site_on_server; then
+      # نقل سابق انقطع قبل أن يصل الزوار إلى قاعدة السيرفر: يُعاد بنسخة جديدة من Supabase (فيها ما أُضيف منذ ذلك الحين)
+      mode=transfer; replace=1; resume=1
+      say "النقل السابق انقطع قبل تحويل الموقع (والموقع ما زال على Supabase)؛ سأعيده بنسخة جديدة من Supabase."
+    fi
   elif [ -n "$token" ] || [ -n "${DH_EXPORT_FILE:-}" ] || [ "$replace" = 1 ] || [ ! -f "$ETC/backend-was-live" ]; then mode=transfer
   else mode=reattach; fi
   if [ "$mode" = live ] && { [ -n "$token" ] || [ "$replace" = 1 ]; }; then
@@ -1527,6 +1560,10 @@ cmd_install_db() {
   mkdir -p "$STATE"; chmod 700 "$STATE"
   take_lock
   shred_export   # بقايا تشغيل سابق انقطع
+  if [ "$resume" = 1 ]; then
+    caddy_switch supabase || die "تعذّر تثبيت إعداد Supabase في Caddy قبل إعادة النقل؛ لم يتغير شيء"
+    rm -f -- "$BACKEND_FLAG" "$ETC/switch-pending"
+  fi
   if [ "$mode" = live ] && [ ! -f "$ETC/backend-was-live" ]; then
     # الموقع عمل على هذه القاعدة (تحويل سابق انقطع قبل أن يكتب العلامة): لا يستبدلها نقل لاحق دون --replace
     date -u +%FT%TZ > "$ETC/backend-was-live"
@@ -1539,8 +1576,10 @@ cmd_install_db() {
 
   say "٢/٦ تجهيز قاعدة $DB على PostgreSQL في السيرفر…"
   pg_checks
-  # نسخة منقولة من تشغيل سابق انقطع (فيها بيانات المشرفين)؛ لا تلزم بين تشغيل وآخر
+  # نسخ من تشغيل سابق انقطع (فيها بيانات المشرفين)؛ لا تلزم بين تشغيل وآخر،
+  # والقديمة منها محفوظة في النسخة الاحتياطية التي سبقت الاستبدال
   drop_db "${DB}_new"
+  drop_db "${DB}_old"
   case $mode in
     live)
       db_utf8_or_die
@@ -1582,7 +1621,8 @@ $(restore_hint)
     build_new_db "$rel"
     # ما على قاعدة السيرفر الحالية يُحفظ دائماً قبل أن تحل محلها النسخة المنقولة
     if db_has_data; then
-      ( QUIET=1 cmd_backup ) || die "تعذّرت النسخة الاحتياطية من قاعدة السيرفر الحالية؛ لم يتغير شيء"
+      say "  حفظ قاعدة السيرفر الحالية قبل أن تحل محلها النسخة المنقولة:"
+      ( BACKUP_TAG=before-replace cmd_backup ) || die "تعذّرت النسخة الاحتياطية من قاعدة السيرفر الحالية؛ لم يتغير شيء"
     fi
     swap_in_new_db
     shred_export
@@ -1593,6 +1633,9 @@ $(restore_hint)
     db_owner_grants
     app_migrations "$rel"
     say "٣/٦ البيانات على السيرفر كما هي (لا نقل جديد)."
+    if [ "$mode" = reattach ]; then
+      warn "ما أُضيف في Supabase منذ db-rollback لا يُنقل. لنقله مع كل البيانات: sudo dalil-hama-site install-db --replace"
+    fi
   fi
   pg -d "$DB" -Atc "select name from dh_meta.migrations order by 1" | LC_ALL=C sort > "$ETC/applied-migrations"
   chmod 644 "$ETC/applied-migrations"
@@ -1612,7 +1655,14 @@ $(restore_hint)
     write_override
     caddy_switch local || die "رفض Caddy إعداد الموقع المحدّث؛ بقي كما كان"
     backend_serving || die "الموقع لا يقرأ من قاعدة السيرفر كما يجب؛ راجع: sudo dalil-hama-site status"
+    if [ -f "$ETC/switch-pending" ]; then
+      warn "النقل السابق انقطع بعد تحويل الموقع؛ ما أُضيف في Supabase بعد $(cat "$ETC/switch-pending") ليس على السيرفر"
+      rm -f -- "$ETC/switch-pending"
+    fi
     install_backup_units
+    if [ -z "$(find "$BACKUP_DIR" -maxdepth 1 -name "$DB-*.dump" 2>/dev/null | head -n 1)" ]; then
+      ( QUIET=1 cmd_backup ) || warn "تعذّرت النسخة الاحتياطية؛ جرّب: sudo dalil-hama-site backup"
+    fi
     fix_owner
     ok "قاعدة السيرفر وخدماتها محدّثة، والبيانات كما هي."
     return 0
@@ -1623,26 +1673,45 @@ $(restore_hint)
 
   say "٥/٦ تحويل الموقع إلى قاعدة السيرفر…"
   [ -f "$ETC/backend-was-live" ] && had_marker=1
+  # الرجوع إلى Supabase: العلامات تُحذف فقط إن تحوّل Caddy فعلاً، وإلا تبقى الحالة «السيرفر» كما هي في الواقع.
+  # وبعد أن وصل الزوار إلى قاعدة السيرفر (switched=1) تبقى علامة backend-was-live كي لا يستبدلها نقل لاحق دون نسخة احتياطية
   switch_back() {
-    rm -f -- "$BACKEND_FLAG"
-    caddy_switch supabase || true
-    if [ "$had_marker" = 0 ]; then rm -f -- "$ETC/backend-was-live"; fi
+    caddy_switch supabase || return 1
+    rm -f -- "$BACKEND_FLAG" "$ETC/switch-pending"
+    if [ "$had_marker" = 0 ] && [ "$switched" = 0 ]; then rm -f -- "$ETC/backend-was-live"; fi
   }
-  switch_abort() { trap - INT TERM HUP; switch_back >/dev/null 2>&1; exit 130; }
+  switch_abort() {
+    trap '' INT TERM HUP   # إشارة ثانية لا تقطع الرجوع في منتصفه
+    if switch_back >/dev/null 2>&1; then warn "قُطع الأمر فأعدت الموقع إلى Supabase"
+    else warn "قُطع الأمر والموقع قد يقرأ من قاعدة السيرفر؛ راجع: sudo dalil-hama-site status (للرجوع: sudo dalil-hama-site db-rollback)"; fi
+    exit 130
+  }
   trap switch_abort INT TERM HUP
   write_override force
   fix_owner
-  # العلامتان قبل Caddy: إن انقطع الأمر بعد التحويل، يُكمله تشغيله من جديد ولا يستبدل نقلٌ لاحق ما كُتب على السيرفر
+  # العلامات قبل Caddy: إن انقطع الأمر بعد التحويل، يُكمله تشغيله من جديد ولا يستبدل نقلٌ لاحق ما كُتب على السيرفر؛
+  # وswitch-pending تبقى حتى يثبت أن الموقع يقرأ من السيرفر (وإلا يُعاد النقل بنسخة جديدة)
   touch "$BACKEND_FLAG"
+  date -u '+%F %H:%M UTC' > "$ETC/switch-pending"
   date -u +%FT%TZ > "$ETC/backend-was-live"
+  switched=1
   if ! caddy_switch local; then
-    switch_back
-    die "رفض Caddy إعداد الموقع الجديد؛ الموقع ما زال يقرأ من Supabase كما كان"
+    # Caddy رفض الإعداد فبقي على ما كان (Supabase): لم يصل أحد إلى قاعدة السيرفر
+    switched=0
+    rm -f -- "$BACKEND_FLAG" "$ETC/switch-pending"
+    if [ "$had_marker" = 0 ]; then rm -f -- "$ETC/backend-was-live"; fi
+    trap - INT TERM HUP
+    die "تعذّر تحويل Caddy؛ الموقع ما زال يقرأ من Supabase كما كان"
   fi
   if ! backend_serving "$EXPORT_APPROVED"; then
-    switch_back
-    die "الموقع لم يقرأ من قاعدة السيرفر كما يجب فأعدته إلى Supabase؛ لم يتغير شيء للزوار"
+    if switch_back; then
+      trap - INT TERM HUP
+      die "الموقع لم يقرأ من قاعدة السيرفر كما يجب فأعدته إلى Supabase. راجع: sudo dalil-hama-site status ثم أعد النقل: sudo dalil-hama-site install-db --replace (يحفظ ما كُتب على السيرفر في نسخة احتياطية أولاً)"
+    fi
+    trap - INT TERM HUP
+    die "الموقع لم يقرأ من قاعدة السيرفر كما يجب، وتعذّرت إعادته إلى Supabase فبقي على قاعدة السيرفر. راجع: sudo dalil-hama-site status (للرجوع: sudo dalil-hama-site db-rollback)"
   fi
+  rm -f -- "$ETC/switch-pending"
   trap - INT TERM HUP
   ok "الموقع يقرأ الآن من قاعدة السيرفر"
 
@@ -1664,11 +1733,14 @@ cmd_backup() {
   db_exists || die "لا توجد قاعدة $DB على هذا السيرفر"
   mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
   local out
-  out=$BACKUP_DIR/$DB-$(date -u +%Y%m%d-%H%M%S).dump
+  # بقايا نسخ انقطعت (أقدم من ساعة، فلا تمس نسخة جارية الآن)
+  find "$BACKUP_DIR" -maxdepth 1 -name "$DB-*.dump.tmp" -mmin +60 -delete 2>/dev/null || true
+  out=$BACKUP_DIR/$DB-${BACKUP_TAG:+$BACKUP_TAG-}$(date -u +%Y%m%d-%H%M%S).dump
   runuser -u postgres -- pg_dump -Fc "$DB" > "$out.tmp" || { rm -f -- "$out.tmp"; die "فشل النسخ الاحتياطي"; }
   [ "$(stat -c%s "$out.tmp")" -gt 2000 ] || { rm -f -- "$out.tmp"; die "النسخة الاحتياطية صغيرة على نحو غير طبيعي؛ لم تُحفظ"; }
   chmod 600 "$out.tmp"; mv -f -- "$out.tmp" "$out"
-  find "$BACKUP_DIR" -maxdepth 1 -name "$DB-*.dump" -mtime +14 -delete
+  # التدوير للنسخ الليلية فقط؛ نسخ ما قبل الاستبدال أو الاسترجاع (before-*) تبقى
+  find "$BACKUP_DIR" -maxdepth 1 -name "$DB-2*.dump" -mtime +14 -delete
   ok "نسخة احتياطية: $out ($(du -h "$out" | cut -f1))"
 }
 
@@ -1677,13 +1749,57 @@ cmd_db_rollback() {
   detect_caddy
   take_lock
   # الإعداد قد يبقى موجَّهاً إلى السيرفر دون العلامة (رجوع سابق انقطع بإصدار أقدم من هذا الأمر)
-  [ -f "$BACKEND_FLAG" ] || grep -q 'handle_path /rest/v1/' "$SITE_CONF" 2>/dev/null || die "الموقع يقرأ من Supabase أصلاً"
+  [ -f "$BACKEND_FLAG" ] || grep -q 'handle_path /rest/v1/' "$SITE_CONF" 2>/dev/null || site_on_server ||
+    die "الموقع يقرأ من Supabase أصلاً"
   # العلامة تُحذف بعد نجاح التحويل فقط: انقطاع الأمر يترك الحالة «السيرفر» ويكفي تكراره
   caddy_switch supabase || die "تعذّر تفعيل الإعداد؛ بقي الموقع على قاعدة السيرفر"
-  rm -f -- "$BACKEND_FLAG"
+  rm -f -- "$BACKEND_FLAG" "$ETC/switch-pending"
   ok "عاد الموقع إلى قراءة البيانات من Supabase."
   warn "ما أُضيف أو عُدّل على قاعدة السيرفر منذ النقل ليس في Supabase. قاعدة السيرفر باقية كما هي."
-  say "  للعودة إلى قاعدة السيرفر:  sudo dalil-hama-site install-db"
+  say "  للعودة إلى قاعدة السيرفر كما هي:  sudo dalil-hama-site install-db"
+  say "  أو لنقل جديد من Supabase يشمل ما يُضاف فيها من الآن (مع نسخة احتياطية من قاعدة السيرفر أولاً):"
+  say "                                    sudo dalil-hama-site install-db --replace"
+}
+
+# استرجاع نسخة احتياطية في قاعدة مؤقتة ثم وضعها مكان القاعدة الحالية دفعة واحدة؛
+# الأدوار تُنشأ أولاً (عنقود PostgreSQL أُعيد إنشاؤه لا يحويها)
+cmd_db_restore() {
+  need_root db-restore
+  need_tools psql pg_restore pg_dump runuser flock python3
+  local file=${1:-} n new=${DB}_new
+  systemctl is-active --quiet postgresql || die "PostgreSQL لا يعمل على هذا السيرفر"
+  mkdir -p "$STATE"; chmod 700 "$STATE"
+  take_lock
+  if [ -z "$file" ]; then file=$(ls -1t -- "$BACKUP_DIR/$DB-"*.dump 2>/dev/null | head -n 1) || file=; fi
+  [ -n "$file" ] && [ -f "$file" ] || die "لا توجد نسخة احتياطية في $BACKUP_DIR"
+  load_secrets
+  pg_checks
+  db_roles
+  drop_db "$new"
+  pg -c "set client_min_messages = warning" \
+     -c "create database $new owner dalil_owner encoding 'UTF8' lc_collate 'C.UTF-8' lc_ctype 'C.UTF-8' template template0" \
+     -c "revoke all on database $new from public" \
+     -c "grant connect, temporary on database $new to authenticator, supabase_auth_admin" >/dev/null
+  say "استرجاع ${file##*/}…"
+  if ! runuser -u postgres -- pg_restore --exit-on-error -d "$new" < "$file" 2>"$STATE/restore.log"; then
+    tail -n 5 "$STATE/restore.log" >&2
+    drop_db "$new"
+    die "تعذّر استرجاع ${file##*/}؛ لم يتغير شيء"
+  fi
+  n=$(pg -d "$new" -Atc "select count(*) from public.listings" 2>/dev/null) || n=0
+  if [ "${n:-0}" -le 0 ]; then drop_db "$new"; die "النسخة ${file##*/} لا تحوي أنشطة؛ لم يتغير شيء"; fi
+  if db_has_data; then
+    say "  حفظ القاعدة الحالية قبل أن تحل محلها النسخة المسترجعة:"
+    ( BACKUP_TAG=before-restore cmd_backup ) || { drop_db "$new"; die "تعذّرت النسخة الاحتياطية من القاعدة الحالية؛ لم يتغير شيء"; }
+  fi
+  swap_in_new_db
+  ok "استُرجعت ${file##*/} ($n نشاطاً)"
+  if [ -f "$BACKEND_FLAG" ]; then
+    # تشغيل الخدمات على القاعدة المسترجعة والتحقق أن الموقع يقرأ منها
+    cmd_install_db
+  else
+    say "  الموقع يقرأ من Supabase الآن؛ للعودة إلى قاعدة السيرفر:  sudo dalil-hama-site install-db"
+  fi
 }
 
 unit_state() {
@@ -1722,15 +1838,23 @@ cmd_status() {
   else say "التحديث التلقائي:   $(unit_state "$UNIT.timer")"; fi
   if [ -s "$BASE/.last-error" ]; then say "آخر خطأ في التحديث:  $(cat "$BASE/.last-error")"; fi
   say "الموقع القديم:      $(unit_state dalil-hama)"
+  local on_server=0
+  if [ -n "$served" ] && site_on_server; then on_server=1; fi
   if [ -f "$BACKEND_FLAG" ]; then
     local n last
     n=$(pg -d "$DB" -Atc "select count(*) from public.listings where status = 'approved'" 2>/dev/null) || n="؟"
-    last=$(find "$BACKUP_DIR" -maxdepth 1 -name "$DB-*.dump" -printf '%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null | sort | tail -n 1)
+    last=$( { find "$BACKUP_DIR" -maxdepth 1 -name "$DB-*.dump" -printf '%TY-%Tm-%Td %TH:%TM\n' 2>/dev/null || true; } | sort | tail -n 1)
     say "قاعدة البيانات:     السيرفر ($DB، $n نشاطاً منشوراً)"
+    if [ -n "$served" ] && [ "$on_server" = 0 ]; then
+      say "  ! لكن الموقع لا يقرأ منها الآن (تحويل لم يكتمل): sudo dalil-hama-site install-db"
+    fi
     say "خدمة البيانات:      $(unit_state dalil-hama-api)    خدمة الدخول: $(unit_state dalil-hama-auth)"
     say "آخر نسخة احتياطية:  ${last:-لا يوجد}"
   else
     say "قاعدة البيانات:     Supabase"
+    if [ "$on_server" = 1 ]; then
+      say "  ! لكن الموقع ما زال يقرأ من قاعدة السيرفر: sudo dalil-hama-site db-rollback"
+    fi
   fi
 }
 
@@ -1747,6 +1871,7 @@ case ${1:-} in
   status)   cmd_status ;;
   install-db)  shift; cmd_install_db "$@" ;;
   backup)      shift; cmd_backup "$@" ;;
+  db-restore)  shift; cmd_db_restore "$@" ;;
   db-rollback) cmd_db_rollback ;;
   *)        usage; exit 2 ;;
 esac

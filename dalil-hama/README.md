@@ -124,6 +124,8 @@ curl -fsSL https://raw.githubusercontent.com/aposamir/abdulmajid-alia-wedding/<c
 
 `install-db` و`db-rollback` لا يفعّلان إعداد Caddy إن كان فيه تعديل لم يُفعَّل بعد على موقع آخر (n8n مثلاً): فعّله أو ألغه أولاً.
 
+بعد النقل يُجعل Supabase للقراءة فقط بالملف `deploy/supabase/readonly-after-move.sql` (يحذف دالة التصدير المؤقتة ويمنع الكتابة)، فلا تكتب التبويبات القديمة ما لا يراه أحد. إن عاد الموقع إلى Supabase نهائياً بعد `db-rollback` تُعاد الكتابة بالملف `deploy/supabase/reopen-writes.sql`. الملفان خارج `supabase/migrations` عمداً، فلا يُطبَّقان على قاعدة السيرفر.
+
 **ترويسات الأمان التي يضيفها Caddy:** سياسة أمان المحتوى (CSP) تسمح فقط بالنطاق نفسه وSupabase وcdnjs (مكتبة الخريطة مع تحقق SRI) وبلاطات OpenStreetMap، وHSTS، ومنع التضمين في إطارات خارجية، وسماح بالموقع الجغرافي والميكروفون لهذا الموقع وحده (لـ«الأقرب إليّ» والبحث بالصوت).
 
 خيار بديل: الموقع يعمل على أي خدمة استضافة ثابتة (مجلد النشر `dalil-hama/public`)، وملف `render.yaml` جاهز لـ Render.
